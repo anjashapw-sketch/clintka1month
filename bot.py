@@ -1,11 +1,10 @@
 """
-Username Info Bot — DEEP LOGIC EDITION (v5 - MULTI FORCE JOIN)
-+ Auto-installs missing modules
-+ 3 Force Join channels (env configurable)
-+ No external requests module (uses urllib)
-+ Group me silent
-+ Credit Management
-+ JSON storage
+Username Info Bot — v6 FIXED
++ Quotes-free .env support
++ /id command for debugging
++ Multi force join (3 channels)
++ Auto-install missing modules
++ Better startup logging
 """
 
 import os, sys, subprocess, time
@@ -99,42 +98,79 @@ logging.basicConfig(
 )
 logger = logging.getLogger("username_info_bot")
 
+# ---------- Helper: clean env value (strips quotes & whitespace) ----------
+def _clean_env(key, default=""):
+    """Get env var and strip quotes/whitespace"""
+    val = os.getenv(key, default)
+    if val is None:
+        return default
+    val = str(val).strip()
+    # Strip surrounding quotes
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+        val = val[1:-1]
+    return val
+
 # ---------- Config ----------
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
-BOT_USERNAME = os.getenv("BOT_USERNAME", "@YourBot")
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@admin")
+BOT_TOKEN = _clean_env("BOT_TOKEN")
+_admin_id_raw = _clean_env("ADMIN_ID", "0")
+try:
+    ADMIN_ID = int(_admin_id_raw)
+except ValueError:
+    logger.critical(f"❌ ADMIN_ID is not a valid number: '{_admin_id_raw}'")
+    sys.exit(1)
 
-TG2NUM_API_URL = os.getenv(
-    "TG2NUM_API_URL",
-    "https://tg2num-botadminshere.vercel.app/?id="
-)
-DATA_FILE = os.getenv("DATA_FILE", "data.json")
+BOT_USERNAME = _clean_env("BOT_USERNAME", "@YourBot")
+ADMIN_USERNAME = _clean_env("ADMIN_USERNAME", "@admin")
 
-SEARCH_COST = int(os.getenv("SEARCH_COST", 10))
-SIGNUP_BONUS = int(os.getenv("SIGNUP_BONUS", 30))
-REFERRAL_BONUS = int(os.getenv("REFERRAL_BONUS", 10))
+TG2NUM_API_URL = _clean_env("TG2NUM_API_URL", "https://tg2num-botadminshere.vercel.app/?id=")
+DATA_FILE = _clean_env("DATA_FILE", "data.json")
+
+try:
+    SEARCH_COST = int(_clean_env("SEARCH_COST", "10"))
+    SIGNUP_BONUS = int(_clean_env("SIGNUP_BONUS", "30"))
+    REFERRAL_BONUS = int(_clean_env("REFERRAL_BONUS", "10"))
+except ValueError as e:
+    logger.critical(f"❌ Invalid numeric config: {e}")
+    sys.exit(1)
 
 if not BOT_TOKEN:
     logger.critical("❌ BOT_TOKEN missing in environment")
     sys.exit(1)
 
-# ---------- Force Join Env Loading ----------
+if ADMIN_ID == 0:
+    logger.warning("⚠️ ADMIN_ID is 0 — no admin will be recognized!")
+
+# ---------- Force Join Env ----------
 def _load_force_join_env():
-    """Read 3 force join channels from env"""
-    enabled = os.getenv("FORCE_JOIN_ENABLED", "false").lower() == "true"
+    enabled_raw = _clean_env("FORCE_JOIN_ENABLED", "false").lower()
+    enabled = enabled_raw in ("true", "1", "yes", "on")
     channels = []
-    for i in (1, 2, 3):
-        cid = os.getenv(f"FORCE_JOIN_CHANNEL_{i}", "").strip()
-        link = os.getenv(f"FORCE_JOIN_LINK_{i}", "").strip()
+    for i in (1, 2, 3, 4, 5):
+        cid = _clean_env(f"FORCE_JOIN_CHANNEL_{i}")
+        link = _clean_env(f"FORCE_JOIN_LINK_{i}")
         if cid:
             if not link:
-                link = f"https://t.me/{cid.lstrip('@')}" if cid.startswith("@") else f"https://t.me/c/{cid.lstrip('-100')}"
+                if cid.startswith("@"):
+                    link = f"https://t.me/{cid.lstrip('@')}"
+                else:
+                    link = ""
             channels.append({"channel": cid, "link": link})
     return enabled, channels
 
 _FJ_ENV_ENABLED, _FJ_ENV_CHANNELS = _load_force_join_env()
-logger.info(f"🔗 Force Join from env: {'ON' if _FJ_ENV_ENABLED else 'OFF'} ({len(_FJ_ENV_CHANNELS)} channels)")
+
+# ---------- Startup Log ----------
+logger.info("=" * 55)
+logger.info("🚀 STARTING BOT v6")
+logger.info(f"👑 ADMIN_ID: {ADMIN_ID} ({type(ADMIN_ID).__name__})")
+logger.info(f"📞 ADMIN_USERNAME: {ADMIN_USERNAME}")
+logger.info(f"🤖 BOT_USERNAME: {BOT_USERNAME}")
+logger.info(f"💰 SEARCH_COST: {SEARCH_COST} | SIGNUP: {SIGNUP_BONUS} | REFERRAL: {REFERRAL_BONUS}")
+logger.info(f"🔗 FORCE_JOIN_ENABLED: {_FJ_ENV_ENABLED}")
+logger.info(f"📢 FORCE_JOIN_CHANNELS: {len(_FJ_ENV_CHANNELS)}")
+for i, ch in enumerate(_FJ_ENV_CHANNELS, 1):
+    logger.info(f"   [{i}] {ch['channel']} → {ch['link']}")
+logger.info("=" * 55)
 
 # ---------- SSL ----------
 _SSL_CTX = ssl.create_default_context()
@@ -177,12 +213,7 @@ ALL_BUTTONS = [
 
 # ---------- JSON Storage ----------
 def _default_data():
-    env_channels = []
-    for ch in _FJ_ENV_CHANNELS:
-        env_channels.append({
-            "channel": ch["channel"],
-            "link": ch["link"]
-        })
+    env_channels = [{"channel": ch["channel"], "link": ch["link"]} for ch in _FJ_ENV_CHANNELS]
     return {
         "users": {},
         "stats": {"total_searches": 0, "searches_today": 0, "last_date": ""},
@@ -209,7 +240,6 @@ def load_data():
         d["settings"].setdefault("force_join", default["settings"]["force_join"])
         fj = d["settings"]["force_join"]
         fj.setdefault("enabled", False)
-        # Migrate old format (single channel) → new format (list)
         if "channels" not in fj:
             old_ch = fj.get("channel")
             old_link = fj.get("channel_link")
@@ -219,13 +249,12 @@ def load_data():
                 fj["channels"] = []
             fj.pop("channel", None)
             fj.pop("channel_link", None)
-        # If env enabled and DB empty, seed from env
-        if _FJ_ENV_ENABLED and not fj["channels"] and _FJ_ENV_CHANNELS:
+        # If DB has no channels but env does, seed from env
+        if not fj["channels"] and _FJ_ENV_CHANNELS:
             fj["channels"] = [
                 {"channel": ch["channel"], "link": ch["link"]}
                 for ch in _FJ_ENV_CHANNELS
             ]
-            fj["enabled"] = True
         return d
     except Exception as e:
         logger.error(f"Corrupt data.json, resetting... Error: {e}")
@@ -444,13 +473,13 @@ def build_search_frames(prefix="🔒 <b>Username Lookup</b>"):
     frames.append(f"✅ {prefix}\n<code>{progress_bar(100)}</code>")
     return frames
 
-# ================= FORCE JOIN (MULTI) =================
+# ================= FORCE JOIN =================
 def get_fj_channels():
-    """Return list of {channel, link}"""
     fj = settings.get("force_join", {})
     return fj.get("channels", []) or []
 
 def is_user_joined(uid):
+    """Returns True if user has joined all required channels (or admin)"""
     fj = settings.get("force_join", {})
     if not fj.get("enabled"):
         return True
@@ -458,7 +487,7 @@ def is_user_joined(uid):
     if not channels:
         return True
     if uid == ADMIN_ID:
-        return True
+        return True  # ⭐ ADMIN ALWAYS BYPASSES
 
     for ch in channels:
         cid = ch.get("channel")
@@ -473,8 +502,8 @@ def is_user_joined(uid):
                 continue
             return False  # Not joined this channel
         except Exception as e:
-            logger.warning(f"ForceJoin check failed for {uid} on {cid}: {e} — failing OPEN")
-            # If bot can't check (not admin), fail open to not break user
+            logger.warning(f"ForceJoin check FAILED for uid={uid} on {cid}: {e}")
+            # ⭐ If check fails (bot not admin), fail OPEN so users aren't blocked
             continue
     return True
 
@@ -485,6 +514,8 @@ def build_join_kb():
         link = ch.get("link") or ""
         if link:
             kb.add(InlineKeyboardButton(f"📢 Join Channel {i}", url=link))
+        else:
+            kb.add(InlineKeyboardButton(f"📢 Channel {i} (no link)", callback_data="noop"))
     kb.add(InlineKeyboardButton("✅ I've Joined All", callback_data="check_join"))
     return kb
 
@@ -525,6 +556,10 @@ def cb_check_join(c):
         except: pass
     else:
         bot.answer_callback_query(c.id, "❌ Kuch channels join nahi kiye!", show_alert=True)
+
+@bot.callback_query_handler(func=lambda c: c.data == "noop")
+def cb_noop(c):
+    bot.answer_callback_query(c.id)
 
 # ---------- Keyboards ----------
 def main_kb(uid):
@@ -576,7 +611,7 @@ def force_join_status_text():
     else:
         lines.append("<i>No channels set</i>")
     lines.append("")
-    lines.append("<i>Env se load ho sakte hain ya admin panel se add karein.</i>")
+    lines.append("<i>Env se load hote hain. Admin panel se add/remove karo.</i>")
     return "\n".join(lines)
 
 # ================= CORE LOOKUP =================
@@ -674,6 +709,29 @@ def process_tg2num(uid, cid, query, reply_to=None):
         am.edit(f"😔 No data found for {esc(display_name)}.")
 
 # ================= HANDLERS =================
+@bot.message_handler(commands=['id', 'myid', 'whoami'])
+def cmd_id(m):
+    """Debug command — shows user their Telegram ID and admin status"""
+    if m.chat.type != 'private':
+        return
+    uid = m.from_user.id
+    uname = m.from_user.username or "no_username"
+    is_adm = "✅ YES" if uid == ADMIN_ID else "❌ NO"
+    try:
+        is_fj = "✅ JOINED" if is_user_joined(uid) else "❌ NOT JOINED"
+    except:
+        is_fj = "⚠️ ERROR"
+    bot.reply_to(
+        m,
+        f"🆔 <b>Your Telegram Info</b>\n\n"
+        f"<b>Your ID:</b> <code>{uid}</code>\n"
+        f"<b>Username:</b> @{esc(uname)}\n"
+        f"<b>Admin?:</b> {is_adm}\n"
+        f"<b>Config ADMIN_ID:</b> <code>{ADMIN_ID}</code>\n"
+        f"<b>Force Join:</b> {is_fj}",
+        parse_mode='HTML'
+    )
+
 @bot.message_handler(commands=['start'])
 def cmd_start(m):
     if m.chat.type != 'private':
@@ -799,9 +857,9 @@ def btn_force_join(m):
 def btn_set_channel(m):
     msg = bot.reply_to(
         m,
-        "Send the channel username (e.g. <code>@mychannel</code>) or channel ID "
+        "Send channel username (e.g. <code>@mychannel</code>) or numeric ID "
         "(e.g. <code>-1001234567890</code>).\n\n"
-        "<i>Note: This will ADD a new channel. To remove, restart with updated env.</i>",
+        "<i>Adds a new channel to the list.</i>",
         parse_mode='HTML'
     )
     bot.register_next_step_handler(msg, do_set_channel)
@@ -819,10 +877,7 @@ def do_set_channel(m):
         link = ""
         if chat.username:
             link = f"https://t.me/{chat.username}"
-        settings["force_join"]["channels"].append({
-            "channel": val,
-            "link": link
-        })
+        settings["force_join"]["channels"].append({"channel": val, "link": link})
         save_data(data)
         bot.reply_to(
             m,
@@ -1051,11 +1106,6 @@ def private_text_handler(m):
 
 # ================= ENTRY =================
 if __name__ == "__main__":
-    logger.info("🚀 Bot starting (v5 MULTI FORCE JOIN)...")
-    logger.info(f"👑 Admin ID: {ADMIN_ID}")
-    logger.info(f"📞 Admin contact: {ADMIN_USERNAME}")
-    fj = settings.get("force_join", {})
-    logger.info(f"🔗 Force Join: {'ON' if fj.get('enabled') else 'OFF'} ({len(get_fj_channels())} channels)")
     try:
         bot.infinity_polling(timeout=60, long_polling_timeout=30)
     except KeyboardInterrupt:
