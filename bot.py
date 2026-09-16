@@ -1,9 +1,8 @@
 """
-Username Info Bot — v10 PRIVATE CHANNEL FIX
-+ Force join FIRST (no welcome before verify)
-+ Private channel with join request → FAIL-OPEN (user not blocked)
-+ Public channel → STRICT check
-+ Multi-admin, env-driven, auto-install
+Username Info Bot — v9 FORCE JOIN FIRST
++ Force join prompt PEHLE (no welcome before verify)
++ Welcome message ONLY after verification
++ Multi-admin, env-driven force join, auto-install
 """
 
 import os, sys, subprocess, time
@@ -437,32 +436,11 @@ def build_search_frames(prefix="🔒 <b>Username Lookup</b>"):
     return frames
 
 # ============================================================
-# FORCE JOIN — with PRIVATE CHANNEL support
+# FORCE JOIN
 # ============================================================
 _FJ_ACTIVE = False
 _FJ_VALID_CHANNELS = []
 _FJ_INVALID_CHANNELS = []
-_FJ_CHANNEL_META = {}   # cache: cid → {"is_private": bool}
-
-def _cache_channel_meta():
-    """Cache whether each channel is private or public"""
-    global _FJ_CHANNEL_META
-    _FJ_CHANNEL_META = {}
-    for ch in _FJ_CHANNELS:
-        cid = ch.get("channel")
-        try:
-            info = bot.get_chat(cid)
-            is_private = not getattr(info, "username", None)
-            _FJ_CHANNEL_META[cid] = {
-                "is_private": is_private,
-                "title": getattr(info, "title", ""),
-                "username": getattr(info, "username", None),
-            }
-            logger.info(f"   📋 {cid} — {'PRIVATE' if is_private else 'PUBLIC'}")
-        except Exception as e:
-            # Assume private if we can't determine (safer for user)
-            _FJ_CHANNEL_META[cid] = {"is_private": True, "title": "", "username": None}
-            logger.warning(f"   ⚠️ {cid} — cannot get info: {e} (assuming PRIVATE)")
 
 def _validate_fj_channels_startup():
     global _FJ_ACTIVE, _FJ_VALID_CHANNELS, _FJ_INVALID_CHANNELS
@@ -483,9 +461,6 @@ def _validate_fj_channels_startup():
         logger.error(f"❌ Cannot get bot info: {e}")
         _FJ_ACTIVE = False
         return
-
-    # Cache channel metadata first
-    _cache_channel_meta()
 
     valid, invalid = [], []
     for ch in _FJ_CHANNELS:
@@ -516,27 +491,7 @@ def _validate_fj_channels_startup():
 def get_fj_active_channels():
     return _FJ_VALID_CHANNELS
 
-def _is_private_channel(cid):
-    """Check if channel is private (cached or live check)"""
-    if cid in _FJ_CHANNEL_META:
-        return _FJ_CHANNEL_META[cid].get("is_private", True)
-    # Fallback live check
-    try:
-        info = bot.get_chat(cid)
-        is_private = not getattr(info, "username", None)
-        _FJ_CHANNEL_META[cid] = {"is_private": is_private}
-        return is_private
-    except Exception:
-        # Can't determine → assume private (fail-open)
-        return True
-
 def is_user_joined(uid):
-    """
-    Check if user joined all required channels.
-    - Public channels: STRICT enforcement
-    - Private channels (join requests): FAIL-OPEN (user can't be verified)
-    - Bot errors: FAIL-OPEN
-    """
     if not _FJ_ACTIVE:
         return True
     if is_admin(uid):
@@ -552,40 +507,14 @@ def is_user_joined(uid):
         try:
             member = bot.get_chat_member(cid, uid)
             status = getattr(member, "status", "")
-
-            # ✅ Definitely joined
             if status in ("member", "administrator", "creator"):
                 continue
-
-            # ✅ Restricted but still member
             if status == "restricted" and getattr(member, "is_member", False):
                 continue
-
-            # ❌ Not joined
-            if status in ("left", "kicked"):
-                is_private = _is_private_channel(cid)
-                if is_private:
-                    # Private channel: user might have pending join request
-                    # FAIL-OPEN — let them through
-                    logger.warning(
-                        f"FJ: uid={uid} ch={cid} status={status} "
-                        f"but PRIVATE channel → FAIL-OPEN"
-                    )
-                    continue
-                else:
-                    # Public channel: strict block
-                    logger.info(f"FJ: uid={uid} ch={cid} ❌ {status} (public)")
-                    return False
-
-            # Unknown status → fail-open
-            logger.warning(f"FJ: uid={uid} ch={cid} unknown status='{status}' → FAIL-OPEN")
-            continue
-
+            return False
         except Exception as e:
-            # Any exception → fail-open (bot not admin, user never met, etc.)
-            logger.warning(f"FJ: check error uid={uid} ch={cid}: {e} → FAIL-OPEN")
-            continue
-
+            logger.warning(f"FJ check error uid={uid} ch={cid}: {e}")
+            return False
     return True
 
 def build_join_kb():
@@ -601,6 +530,7 @@ def build_join_kb():
     return kb
 
 def send_force_join_prompt(cid, uid, reply_to=None):
+    """Send ONLY force join prompt"""
     channels = get_fj_active_channels()
     if not channels:
         return False
@@ -609,8 +539,7 @@ def send_force_join_prompt(cid, uid, reply_to=None):
             cid,
             f"⚠️ <b>Force Join Required</b>\n\n"
             f"Bot use karne se pehle <b>{len(channels)}</b> channels join karein:\n\n"
-            f"Join karne ke baad <b>✅ I've Joined All</b> button dabayein.\n\n"
-            f"<i>Private channel me join request bhejni padegi.</i>",
+            f"Join karne ke baad <b>✅ I've Joined All</b> button dabayein.",
             parse_mode="HTML",
             reply_markup=build_join_kb(),
             reply_to_message_id=reply_to
@@ -621,12 +550,14 @@ def send_force_join_prompt(cid, uid, reply_to=None):
         return False
 
 def ensure_joined(uid, cid, reply_to=None):
+    """Returns True if user can proceed, False if force join prompt sent"""
     if is_user_joined(uid):
         return True
     send_force_join_prompt(cid, uid, reply_to)
     return False
 
 def build_welcome_text(uid):
+    """Full welcome text — sent ONLY after verification (or if no FJ)"""
     credits_display = '♾️' if is_admin(uid) else get_credits(uid)
     return (
         f"👋 <b>Welcome!</b>\n\n"
@@ -639,6 +570,7 @@ def build_welcome_text(uid):
     )
 
 def send_welcome(cid, uid, reply_to=None):
+    """Send full welcome + main keyboard"""
     try:
         kw = {"parse_mode": "HTML", "reply_markup": main_kb(uid)}
         if reply_to: kw["reply_to_message_id"] = reply_to
@@ -681,10 +613,7 @@ def force_join_status_text():
     if _FJ_VALID_CHANNELS:
         lines.append(f"<b>✅ Active ({len(_FJ_VALID_CHANNELS)}):</b>")
         for i, ch in enumerate(_FJ_VALID_CHANNELS, 1):
-            cid = ch.get("channel")
-            meta = _FJ_CHANNEL_META.get(cid, {})
-            typ = "PRIVATE" if meta.get("is_private") else "PUBLIC"
-            lines.append(f"  {i}. <code>{esc(cid)}</code> <i>({typ})</i>")
+            lines.append(f"  {i}. <code>{esc(ch.get('channel'))}</code>")
     else:
         lines.append("<i>No active channels</i>")
 
@@ -694,8 +623,6 @@ def force_join_status_text():
         for i, ch in enumerate(_FJ_INVALID_CHANNELS, 1):
             lines.append(f"  {i}. <code>{esc(ch.get('channel'))}</code>")
 
-    lines.append("")
-    lines.append("<i>Private channels = fail-open (users not blocked)</i>")
     return "\n".join(lines)
 
 # ================= CALLBACK: check_join =================
@@ -704,34 +631,30 @@ def cb_check_join(c):
     uid = c.from_user.id
     cid = c.message.chat.id
     if is_user_joined(uid):
+        # Delete force join message
         try: bot.delete_message(cid, c.message.message_id)
         except: pass
         bot.answer_callback_query(c.id, "✅ Verified! Ab bot use kar sakte hain.", show_alert=True)
+        # ⭐ NOW send welcome message (AFTER verify)
         send_welcome(cid, uid)
     else:
+        # Show missing channels
         channels = get_fj_active_channels()
         missing = []
         for ch in channels:
-            ch_cid = ch.get("channel")
+            cid_ch = ch.get("channel")
             try:
-                member = bot.get_chat_member(ch_cid, uid)
+                member = bot.get_chat_member(cid_ch, uid)
                 status = getattr(member, "status", "")
-                if status in ("member", "administrator", "creator"):
-                    continue
-                if status == "restricted" and getattr(member, "is_member", False):
-                    continue
-                if status in ("left", "kicked"):
-                    if _is_private_channel(ch_cid):
-                        continue  # fail-open
-                    missing.append(ch.get("link") or str(ch_cid))
-            except Exception as e:
-                logger.warning(f"cb_check error ch={ch_cid} uid={uid}: {e}")
-                continue
+                if status not in ("member", "administrator", "creator"):
+                    missing.append(ch.get("link") or str(cid_ch))
+            except:
+                missing.append(ch.get("link") or str(cid_ch))
 
         if missing:
             txt = "❌ Ye join nahi kiye:\n" + "\n".join(f"• {m}" for m in missing[:5])
         else:
-            txt = "⚠️ Verification failed. Try /start again."
+            txt = "❌ Kuch channels join nahi kiye!"
         bot.answer_callback_query(c.id, txt, show_alert=True)
 
 @bot.callback_query_handler(func=lambda c: c.data == "noop")
@@ -870,6 +793,7 @@ def cmd_fjreload(m):
     _validate_fj_channels_startup()
     bot.reply_to(m, "🔄 Reloaded.\n\n" + force_join_status_text(), parse_mode='HTML')
 
+# ⭐⭐⭐ CRITICAL: /start with FORCE JOIN FIRST ⭐⭐⭐
 @bot.message_handler(commands=['start'])
 def cmd_start(m):
     if m.chat.type != 'private':
@@ -877,6 +801,7 @@ def cmd_start(m):
 
     uid = m.from_user.id
 
+    # Referral handling
     if ' ' in m.text:
         parts = m.text.split()
         if len(parts) > 1 and parts[1].startswith('ref_'):
@@ -891,10 +816,13 @@ def cmd_start(m):
     user["last_seen"] = datetime.now().isoformat()
     save_data(data)
 
+    # ⭐ FORCE JOIN CHECK FIRST — send ONLY force join prompt
     if not is_user_joined(uid):
+        # Only send force join prompt, NO welcome
         send_force_join_prompt(m.chat.id, uid)
         return
 
+    # Force join passed (or not active) → send welcome
     send_welcome(m.chat.id, uid)
 
 @bot.message_handler(func=lambda m: m.text == "🔒 Username To Info" and m.chat.type == 'private')
@@ -1154,7 +1082,7 @@ def private_text_handler(m):
 # ================= ENTRY =================
 if __name__ == "__main__":
     logger.info("=" * 55)
-    logger.info("🚀 STARTING BOT v10 PRIVATE CHANNEL FIX")
+    logger.info("🚀 STARTING BOT v9 FORCE JOIN FIRST")
     logger.info(f"👑 Total Admins: {len(ADMIN_IDS)}")
     for i, aid in enumerate(ADMIN_IDS, 1):
         logger.info(f"   [{i}] {aid}")
