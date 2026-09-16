@@ -1,5 +1,5 @@
 """
-Username Info Bot — DEEP LOGIC EDITION (v4 - SILENT IN GROUPS)
+Username Info Bot — DEEP LOGIC EDITION (v4.1 - FIXED)
 + Group me bilkul chup (koi reply nahi)
 + Force Join System (Enable/Disable, Channel, Invite Link)
 + Credit Management (Add/Remove/Set/Check User)
@@ -8,20 +8,32 @@ Username Info Bot — DEEP LOGIC EDITION (v4 - SILENT IN GROUPS)
 - Credit Safety: Sirf successful API call par credits deduct
 - JSON storage (No MongoDB)
 - Signup: 30 credits | Referral: 10 credits (dono ko) | Search: 10 credits
++ Safe dotenv import (crash-proof)
++ Atomic credit deductions
++ HTML-safe broadcast
 """
 
 import os, sys, re, json, time, threading, html
 import logging
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
-import requests, telebot
+
+# ---------- Safe dotenv import (optional) ----------
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # python-dotenv not installed — using system env vars
+    pass
+except Exception:
+    pass
+
+import requests
+import telebot
 from telebot.types import (
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton
 )
 
-# ---------- Load Environment ----------
-load_dotenv()
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 
@@ -42,12 +54,19 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "@YourBot")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@admin")
 
-TG2NUM_API_URL = "https://tg2num-botadminshere.vercel.app/?id="
-DATA_FILE = "data.json"
+TG2NUM_API_URL = os.getenv(
+    "TG2NUM_API_URL",
+    "https://tg2num-botadminshere.vercel.app/?id="
+)
+DATA_FILE = os.getenv("DATA_FILE", "data.json")
 
-SEARCH_COST = 10
-SIGNUP_BONUS = 30
-REFERRAL_BONUS = 10
+SEARCH_COST = int(os.getenv("SEARCH_COST", 10))
+SIGNUP_BONUS = int(os.getenv("SIGNUP_BONUS", 30))
+REFERRAL_BONUS = int(os.getenv("REFERRAL_BONUS", 10))
+
+if not BOT_TOKEN:
+    logger.critical("❌ BOT_TOKEN missing in environment")
+    sys.exit(1)
 
 # ---------- All Button Texts ----------
 ALL_BUTTONS = [
@@ -108,47 +127,62 @@ users = data["users"]
 stats = data["stats"]
 settings = data["settings"]
 
+# ---------- Thread Lock for data safety ----------
+_data_lock = threading.RLock()
+
 def get_user(uid):
     uid_str = str(uid)
-    if uid_str not in users:
-        users[uid_str] = {
-            "credits": SIGNUP_BONUS,
-            "searches": 0,
-            "referrals": 0,
-            "referred_by": None,
-            "joined_at": datetime.now().isoformat(),
-            "last_seen": datetime.now().isoformat()
-        }
-        save_data(data)
-    return users[uid_str]
+    with _data_lock:
+        if uid_str not in users:
+            users[uid_str] = {
+                "credits": SIGNUP_BONUS,
+                "searches": 0,
+                "referrals": 0,
+                "referred_by": None,
+                "joined_at": datetime.now().isoformat(),
+                "last_seen": datetime.now().isoformat()
+            }
+            save_data(data)
+        return users[uid_str]
 
 def add_credits(uid, amount):
     uid_str = str(uid)
-    if uid_str not in users:
-        get_user(uid)
-    users[uid_str]["credits"] += amount
-    save_data(data)
+    with _data_lock:
+        if uid_str not in users:
+            get_user(uid)
+        users[uid_str]["credits"] += amount
+        if users[uid_str]["credits"] < 0:
+            users[uid_str]["credits"] = 0
+        save_data(data)
 
 def deduct_credits(uid, amount):
+    """Atomic deduction with floor at 0"""
     uid_str = str(uid)
-    if uid_str in users:
-        users[uid_str]["credits"] -= amount
+    with _data_lock:
+        if uid_str not in users:
+            return False
+        current = users[uid_str].get("credits", 0)
+        if current < amount:
+            return False
+        users[uid_str]["credits"] = current - amount
         save_data(data)
+        return True
 
 def get_credits(uid):
     return users.get(str(uid), {}).get("credits", 0)
 
 def incr_searches(uid):
     uid_str = str(uid)
-    if uid_str in users:
-        users[uid_str]["searches"] += 1
     today = datetime.now().strftime("%Y-%m-%d")
-    if stats["last_date"] != today:
-        stats["last_date"] = today
-        stats["searches_today"] = 0
-    stats["total_searches"] += 1
-    stats["searches_today"] += 1
-    save_data(data)
+    with _data_lock:
+        if uid_str in users:
+            users[uid_str]["searches"] = users[uid_str].get("searches", 0) + 1
+        if stats.get("last_date") != today:
+            stats["last_date"] = today
+            stats["searches_today"] = 0
+        stats["total_searches"] = stats.get("total_searches", 0) + 1
+        stats["searches_today"] = stats.get("searches_today", 0) + 1
+        save_data(data)
 
 def total_users(): return len(users)
 
@@ -174,21 +208,22 @@ def handle_referral(new_uid, referrer_id):
     if new_uid == referrer_id: return False
     new_uid_str = str(new_uid)
     ref_str = str(referrer_id)
-    if new_uid_str not in users:
-        get_user(new_uid)
-    if users[new_uid_str].get("referred_by") is not None:
-        return False
-    users[new_uid_str]["referred_by"] = referrer_id
-    add_credits(new_uid, REFERRAL_BONUS)
-    if ref_str in users:
-        add_credits(referrer_id, REFERRAL_BONUS)
-        users[ref_str]["referrals"] = users[ref_str].get("referrals", 0) + 1
-    else:
-        get_user(referrer_id)
-        add_credits(referrer_id, REFERRAL_BONUS)
-        users[ref_str]["referrals"] = 1
-    save_data(data)
-    return True
+    with _data_lock:
+        if new_uid_str not in users:
+            get_user(new_uid)
+        if users[new_uid_str].get("referred_by") is not None:
+            return False
+        users[new_uid_str]["referred_by"] = referrer_id
+        add_credits(new_uid, REFERRAL_BONUS)
+        if ref_str in users:
+            add_credits(referrer_id, REFERRAL_BONUS)
+            users[ref_str]["referrals"] = users[ref_str].get("referrals", 0) + 1
+        else:
+            get_user(referrer_id)
+            add_credits(referrer_id, REFERRAL_BONUS)
+            users[ref_str]["referrals"] = 1
+        save_data(data)
+        return True
 
 # ---------- Bot Init ----------
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -200,14 +235,20 @@ _rate_lock = threading.Lock()
 _last_call = {}
 def rate_ok(uid):
     if uid == ADMIN_ID: return True
-    now = time.time()
+    now_t = time.time()
     with _rate_lock:
         if len(_last_call) > 10000:
             _last_call.clear()
-        if uid in _last_call and now - _last_call[uid] < 1.2:
+        if uid in _last_call and now_t - _last_call[uid] < 1.2:
             return False
-        _last_call[uid] = now
+        _last_call[uid] = now_t
         return True
+
+# ---------- HTML Escape Helper ----------
+def esc(s):
+    """Safely escape user/admin text for HTML parse mode"""
+    if s is None: return ""
+    return html.escape(str(s), quote=False)
 
 # ---------- Animation Class ----------
 class AnimMsg:
@@ -356,7 +397,10 @@ def cb_check_join(c):
 def main_kb(uid):
     kb = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     kb.row(KeyboardButton("🔒 Username To Info"), KeyboardButton("🛒 Buy Credits"))
-    kb.row(KeyboardButton("👤 My Profile"), KeyboardButton("👑 Admin Panel") if uid == ADMIN_ID else KeyboardButton("ℹ️ About"))
+    if uid == ADMIN_ID:
+        kb.row(KeyboardButton("👤 My Profile"), KeyboardButton("👑 Admin Panel"))
+    else:
+        kb.row(KeyboardButton("👤 My Profile"), KeyboardButton("ℹ️ About"))
     return kb
 
 def admin_kb():
@@ -369,7 +413,7 @@ def admin_kb():
 def force_join_kb():
     kb = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     kb.row(KeyboardButton("🔧 Set Channel"), KeyboardButton("🔗 Set Invite Link"))
-    kb.row(KeyboardButton(f"⚙️ Toggle Force Join"))
+    kb.row(KeyboardButton("⚙️ Toggle Force Join"))
     kb.row(KeyboardButton("🔙 Admin Menu"))
     return kb
 
@@ -388,8 +432,8 @@ def force_join_status_text():
     return (
         f"🔗 <b>Force Join Settings</b>\n\n"
         f"Status: <b>{status}</b>\n"
-        f"Channel: <code>{html.escape(str(channel))}</code>\n"
-        f"Invite Link: <code>{html.escape(str(link))}</code>\n\n"
+        f"Channel: <code>{esc(channel)}</code>\n"
+        f"Invite Link: <code>{esc(link)}</code>\n\n"
         f"<i>Note: Bot ko channel me admin hona chahiye warna verification fail hoga.</i>"
     )
 
@@ -402,10 +446,13 @@ def process_tg2num(uid, cid, query, reply_to=None):
     if not ensure_joined(uid, cid, reply_to):
         return
 
-    if uid != ADMIN_ID and get_credits(uid) < SEARCH_COST:
+    is_admin = (uid == ADMIN_ID)
+
+    if not is_admin and get_credits(uid) < SEARCH_COST:
         bot.send_message(
             cid,
-            f"⚠️ Not enough credits.\n🔎 Cost: {SEARCH_COST}\n💎 Yours: {get_credits(uid)}\n\n🛒 Contact {ADMIN_USERNAME}",
+            f"⚠️ Not enough credits.\n🔎 Cost: {SEARCH_COST}\n"
+            f"💎 Yours: {get_credits(uid)}\n\n🛒 Contact {esc(ADMIN_USERNAME)}",
             reply_to_message_id=reply_to
         )
         return
@@ -429,7 +476,7 @@ def process_tg2num(uid, cid, query, reply_to=None):
         except Exception:
             am.stop()
             am.edit(
-                f"❌ <b>Could not resolve {html.escape(display_name)}</b>\n\n"
+                f"❌ <b>Could not resolve {esc(display_name)}</b>\n\n"
                 f"Telegram bots cannot directly convert random public usernames to IDs (Privacy Policy).\n\n"
                 f"💡 <b>Solution:</b>\n"
                 f"Please provide the <b>Numeric Telegram ID</b> instead.\n"
@@ -443,7 +490,8 @@ def process_tg2num(uid, cid, query, reply_to=None):
         if resp.status_code != 200:
             am.stop(); am.edit(f"⚠️ API Error ({resp.status_code})"); return
         api_data = resp.json()
-    except Exception:
+    except Exception as e:
+        logger.error(f"TG2Num API error: {e}")
         am.stop(); am.edit("⚠️ API Unreachable"); return
 
     if api_data.get("success") and api_data.get("result"):
@@ -453,21 +501,32 @@ def process_tg2num(uid, cid, query, reply_to=None):
         country_code = r.get("country_code", "N/A")
 
         text = (
-            f"✅ <b>Result for {html.escape(display_name)}</b>\n\n"
-            f"🆔 <b>Telegram ID:</b> <code>{tg_id}</code>\n"
-            f"📞 <b>Number:</b> <code>{country_code}{number}</code>\n"
-            f"🌍 <b>Country:</b> {html.escape(str(country))}\n"
+            f"✅ <b>Result for {esc(display_name)}</b>\n\n"
+            f"🆔 <b>Telegram ID:</b> <code>{esc(tg_id)}</code>\n"
+            f"📞 <b>Number:</b> <code>{esc(country_code)}{esc(number)}</code>\n"
+            f"🌍 <b>Country:</b> {esc(country)}\n"
         )
 
-        if uid != ADMIN_ID:
-            deduct_credits(uid, SEARCH_COST)
-            text += f"\n💎 Credits left: {get_credits(uid)}"
+        # Only deduct if API actually returned data AND user is not admin
+        if not is_admin:
+            if deduct_credits(uid, SEARCH_COST):
+                text += f"\n💎 Credits left: {get_credits(uid)}"
+            else:
+                # Edge case: credits dried between check and deduct
+                am.stop(); am.delete()
+                bot.send_message(
+                    cid,
+                    "⚠️ Credits deduction failed (balance too low). Please try again.",
+                    reply_to_message_id=reply_to
+                )
+                return
         incr_searches(uid)
 
         am.stop(); am.delete()
         bot.send_message(cid, text, parse_mode='HTML', reply_to_message_id=reply_to)
     else:
-        am.stop(); am.edit(f"😔 No data found for {html.escape(display_name)}.")
+        am.stop()
+        am.edit(f"😔 No data found for {esc(display_name)}.")
 
 # ================= HANDLERS =================
 @bot.message_handler(commands=['start'])
@@ -492,14 +551,16 @@ def cmd_start(m):
     user["last_seen"] = datetime.now().isoformat()
     save_data(data)
 
+    credits_display = '♾️' if uid == ADMIN_ID else get_credits(uid)
     bot.reply_to(
         m,
         f"👋 <b>Welcome!</b>\n\n"
         f"Main Telegram Username ya Numeric ID ki info nikalta hoon.\n\n"
         f"🔒 Cost: {SEARCH_COST} credits per lookup\n"
-        f"💎 Your credits: {get_credits(uid) if uid != ADMIN_ID else '♾️'}\n\n"
-        f"Send a username (e.g., <code>@username</code>) or Numeric ID (e.g., <code>5339638465</code>) to begin.\n"
-        f"🛒 To buy credits, contact {ADMIN_USERNAME}",
+        f"💎 Your credits: {credits_display}\n\n"
+        f"Send a username (e.g., <code>@username</code>) or Numeric ID "
+        f"(e.g., <code>5339638465</code>) to begin.\n"
+        f"🛒 To buy credits, contact {esc(ADMIN_USERNAME)}",
         parse_mode='HTML',
         reply_markup=main_kb(uid)
     )
@@ -519,11 +580,12 @@ def btn_profile(m):
     user = get_user(uid)
     user["last_seen"] = datetime.now().isoformat()
     save_data(data)
+    credits_display = '♾️' if uid == ADMIN_ID else user.get('credits', 0)
     bot.reply_to(
         m,
         f"👤 <b>Your Profile</b>\n\n"
         f"🆔 <code>{uid}</code>\n"
-        f"💎 Credits: <b>{user.get('credits', 0)}</b>\n"
+        f"💎 Credits: <b>{credits_display}</b>\n"
         f"🔍 Searches: {user.get('searches', 0)}\n"
         f"👥 Referrals: {user.get('referrals', 0)}",
         parse_mode='HTML'
@@ -531,11 +593,16 @@ def btn_profile(m):
 
 @bot.message_handler(func=lambda m: m.text == "🛒 Buy Credits" and m.chat.type == 'private')
 def btn_buy(m):
-    bot.reply_to(m, f"🛒 <b>Buy Credits</b>\n\nContact: {ADMIN_USERNAME}\n\n💎 1 search = {SEARCH_COST} credits", parse_mode='HTML')
+    bot.reply_to(
+        m,
+        f"🛒 <b>Buy Credits</b>\n\nContact: {esc(ADMIN_USERNAME)}\n\n"
+        f"💎 1 search = {SEARCH_COST} credits",
+        parse_mode='HTML'
+    )
 
 @bot.message_handler(func=lambda m: m.text == "ℹ️ About" and m.chat.type == 'private')
 def btn_about(m):
-    bot.reply_to(m, f"ℹ️ Username Info Bot\n{BOT_USERNAME}")
+    bot.reply_to(m, f"ℹ️ Username Info Bot\n{esc(BOT_USERNAME)}")
 
 # ---------- Admin Panel (DM only) ----------
 @bot.message_handler(func=lambda m: m.text == "👑 Admin Panel" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
@@ -565,10 +632,14 @@ def do_broadcast(m):
         bot.reply_to(m, "❌ Broadcast cancelled."); return
     text = m.text
     if not text: return
+
+    # Escape text for HTML to avoid parse errors
+    safe_text = esc(text)
+
     success = 0
     for uid_str in list(users.keys()):
         try:
-            bot.send_message(int(uid_str), text, parse_mode='HTML')
+            bot.send_message(int(uid_str), safe_text, parse_mode='HTML')
             success += 1
             time.sleep(0.05)
         except: pass
@@ -587,7 +658,8 @@ def btn_force_join(m):
 def btn_set_channel(m):
     msg = bot.reply_to(
         m,
-        "Send the channel username (e.g. <code>@mychannel</code>) or channel ID (e.g. <code>-1001234567890</code>).",
+        "Send the channel username (e.g. <code>@mychannel</code>) or channel ID "
+        "(e.g. <code>-1001234567890</code>).",
         parse_mode='HTML'
     )
     bot.register_next_step_handler(msg, do_set_channel)
@@ -608,13 +680,18 @@ def do_set_channel(m):
         save_data(data)
         bot.reply_to(
             m,
-            f"✅ Channel set to <code>{html.escape(val)}</code>\n"
-            f"📛 Title: {html.escape(chat.title or '')}\n"
-            f"🔗 Link: {html.escape(str(settings['force_join'].get('channel_link') or '—'))}",
+            f"✅ Channel set to <code>{esc(val)}</code>\n"
+            f"📛 Title: {esc(chat.title or '')}\n"
+            f"🔗 Link: {esc(str(settings['force_join'].get('channel_link') or '—'))}",
             parse_mode='HTML', reply_markup=force_join_kb()
         )
     except Exception as e:
-        bot.reply_to(m, f"❌ Could not access channel: <code>{html.escape(str(e))}</code>\n\nMake sure bot is added as admin in that channel.", parse_mode='HTML')
+        bot.reply_to(
+            m,
+            f"❌ Could not access channel: <code>{esc(str(e))}</code>\n\n"
+            f"Make sure bot is added as admin in that channel.",
+            parse_mode='HTML'
+        )
 
 @bot.message_handler(func=lambda m: m.text == "🔗 Set Invite Link" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
 def btn_set_link(m):
@@ -630,7 +707,7 @@ def do_set_link(m):
         return
     settings["force_join"]["channel_link"] = val
     save_data(data)
-    bot.reply_to(m, f"✅ Invite link saved:\n<code>{html.escape(val)}</code>", parse_mode='HTML', reply_markup=force_join_kb())
+    bot.reply_to(m, f"✅ Invite link saved:\n<code>{esc(val)}</code>", parse_mode='HTML', reply_markup=force_join_kb())
 
 @bot.message_handler(func=lambda m: m.text == "⚙️ Toggle Force Join" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
 def btn_toggle_fj(m):
@@ -677,8 +754,18 @@ def do_add_credits(m, target):
     get_user(target)
     add_credits(target, amount)
     new_bal = get_credits(target)
-    bot.reply_to(m, f"✅ Added <b>{amount}</b> credits to <code>{target}</code>\n💎 New balance: <b>{new_bal}</b>", parse_mode='HTML', reply_markup=credit_mgr_kb())
-    try: bot.send_message(target, f"🎁 Admin ne aapko <b>{amount}</b> credits diye!\n💎 Balance: <b>{new_bal}</b>", parse_mode='HTML')
+    bot.reply_to(
+        m,
+        f"✅ Added <b>{amount}</b> credits to <code>{target}</code>\n"
+        f"💎 New balance: <b>{new_bal}</b>",
+        parse_mode='HTML', reply_markup=credit_mgr_kb()
+    )
+    try:
+        bot.send_message(
+            target,
+            f"🎁 Admin ne aapko <b>{amount}</b> credits diye!\n💎 Balance: <b>{new_bal}</b>",
+            parse_mode='HTML'
+        )
     except: pass
 
 @bot.message_handler(func=lambda m: m.text == "➖ Remove Credits" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
@@ -707,7 +794,12 @@ def do_remove_credits(m, target):
     get_user(target)
     add_credits(target, -amount)
     new_bal = get_credits(target)
-    bot.reply_to(m, f"✅ Removed <b>{amount}</b> credits from <code>{target}</code>\n💎 New balance: <b>{new_bal}</b>", parse_mode='HTML', reply_markup=credit_mgr_kb())
+    bot.reply_to(
+        m,
+        f"✅ Removed <b>{amount}</b> credits from <code>{target}</code>\n"
+        f"💎 New balance: <b>{new_bal}</b>",
+        parse_mode='HTML', reply_markup=credit_mgr_kb()
+    )
 
 @bot.message_handler(func=lambda m: m.text == "💰 Set Credits" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
 def btn_set_credits(m):
@@ -733,9 +825,14 @@ def do_set_credits(m, target):
     except:
         bot.reply_to(m, "❌ Invalid value.", reply_markup=credit_mgr_kb()); return
     get_user(target)
-    users[str(target)]["credits"] = value
-    save_data(data)
-    bot.reply_to(m, f"✅ Set <code>{target}</code> credits to <b>{value}</b>", parse_mode='HTML', reply_markup=credit_mgr_kb())
+    with _data_lock:
+        users[str(target)]["credits"] = value
+        save_data(data)
+    bot.reply_to(
+        m,
+        f"✅ Set <code>{target}</code> credits to <b>{value}</b>",
+        parse_mode='HTML', reply_markup=credit_mgr_kb()
+    )
 
 @bot.message_handler(func=lambda m: m.text == "👤 Check User" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
 def btn_check_user(m):
@@ -751,7 +848,12 @@ def do_check_user(m):
     target = int(txt)
     u = users.get(str(target))
     if not u:
-        bot.reply_to(m, f"❌ User <code>{target}</code> not found in database.", parse_mode='HTML', reply_markup=credit_mgr_kb()); return
+        bot.reply_to(
+            m,
+            f"❌ User <code>{target}</code> not found in database.",
+            parse_mode='HTML', reply_markup=credit_mgr_kb()
+        )
+        return
     txt_out = (
         f"👤 <b>User Info</b>\n\n"
         f"🆔 <code>{target}</code>\n"
@@ -786,12 +888,21 @@ def private_text_handler(m):
         process_tg2num(uid, m.chat.id, text, m.message_id)
         return
 
-    bot.reply_to(m, "❌ Invalid input. Send a valid Telegram Username (e.g., @username) or Numeric ID (e.g., 5339638465).")
+    bot.reply_to(
+        m,
+        "❌ Invalid input. Send a valid Telegram Username (e.g., @username) "
+        "or Numeric ID (e.g., 5339638465)."
+    )
 
 # ================= ENTRY =================
 if __name__ == "__main__":
-    logger.info("🚀 Bot starting (DEEP LOGIC EDITION v4 - SILENT IN GROUPS)...")
+    logger.info("🚀 Bot starting (DEEP LOGIC EDITION v4.1 FIXED)...")
     logger.info(f"👑 Admin ID: {ADMIN_ID}")
     logger.info(f"📞 Admin contact: {ADMIN_USERNAME}")
     logger.info(f"🔗 Force Join: {'ON' if settings['force_join'].get('enabled') else 'OFF'}")
-    bot.infinity_polling(timeout=60, long_polling_timeout=30)
+    try:
+        bot.infinity_polling(timeout=60, long_polling_timeout=30)
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+    except Exception as e:
+        logger.critical(f"Crashed: {e}")
