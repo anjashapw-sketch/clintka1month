@@ -1,9 +1,11 @@
 """
-Username Info Bot — v7 MULTI ADMIN
-+ 2+ admins support (ADMIN_ID, ADMIN_ID_2, ADMIN_ID_3, ...)
-+ Quotes-free .env
+Username Info Bot — v8 ULTIMATE FORCE JOIN EDITION
++ Env is SINGLE SOURCE OF TRUTH for force join (overrides data.json)
++ Startup validation: bot admin in channels? else auto-disable
++ Fail-OPEN: if can't check, don't block user
++ Multi-admin (ADMIN_ID, ADMIN_ID_2, ...)
 + /id command for debugging
-+ Multi force join (3+ channels)
++ /fjdebug command for admin
 + Auto-install missing modules
 """
 
@@ -98,7 +100,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("username_info_bot")
 
-# ---------- Helper: clean env value ----------
+# ---------- Env helpers ----------
 def _clean_env(key, default=""):
     val = os.getenv(key, default)
     if val is None:
@@ -124,18 +126,15 @@ except ValueError as e:
     logger.critical(f"❌ Invalid numeric config: {e}")
     sys.exit(1)
 
-# ⭐ MULTI ADMIN LOADING
+# ---------- Multi Admin ----------
 def _load_admin_ids():
-    """Load ADMIN_ID, ADMIN_ID_2, ..., ADMIN_ID_10"""
     ids = []
-    # Primary
     primary = _clean_env("ADMIN_ID", "")
     if primary:
         try:
             ids.append(int(primary))
         except ValueError:
             logger.warning(f"⚠️ Invalid ADMIN_ID: {primary}")
-    # Secondary
     for i in range(2, 11):
         v = _clean_env(f"ADMIN_ID_{i}", "")
         if v:
@@ -148,53 +147,30 @@ def _load_admin_ids():
     return ids
 
 ADMIN_IDS = _load_admin_ids()
-ADMIN_ID = ADMIN_IDS[0] if ADMIN_IDS else 0  # primary
+ADMIN_ID = ADMIN_IDS[0] if ADMIN_IDS else 0
 
 def is_admin(uid):
-    """Check if user is admin (any of them)"""
     return uid in ADMIN_IDS
 
-# ---------- Config Validation ----------
 if not BOT_TOKEN:
-    logger.critical("❌ BOT_TOKEN missing in environment")
+    logger.critical("❌ BOT_TOKEN missing")
     sys.exit(1)
 
-if not ADMIN_IDS:
-    logger.warning("⚠️ No admins configured — nobody can access admin panel!")
-
-# ---------- Force Join Env ----------
-def _load_force_join_env():
-    enabled_raw = _clean_env("FORCE_JOIN_ENABLED", "false").lower()
-    enabled = enabled_raw in ("true", "1", "yes", "on")
+# ---------- Force Join Env (SOURCE OF TRUTH) ----------
+def _load_fj_env():
+    raw = _clean_env("FORCE_JOIN_ENABLED", "false").lower()
+    enabled = raw in ("true", "1", "yes", "on")
     channels = []
     for i in range(1, 11):
         cid = _clean_env(f"FORCE_JOIN_CHANNEL_{i}")
         link = _clean_env(f"FORCE_JOIN_LINK_{i}")
         if cid:
             if not link:
-                if cid.startswith("@"):
-                    link = f"https://t.me/{cid.lstrip('@')}"
-                else:
-                    link = ""
+                link = f"https://t.me/{cid.lstrip('@')}" if cid.startswith("@") else ""
             channels.append({"channel": cid, "link": link})
     return enabled, channels
 
-_FJ_ENV_ENABLED, _FJ_ENV_CHANNELS = _load_force_join_env()
-
-# ---------- Startup Log ----------
-logger.info("=" * 55)
-logger.info("🚀 STARTING BOT v7 (MULTI ADMIN)")
-logger.info(f"👑 Total Admins: {len(ADMIN_IDS)}")
-for i, aid in enumerate(ADMIN_IDS, 1):
-    logger.info(f"   [{i}] {aid}")
-logger.info(f"📞 ADMIN_USERNAME: {ADMIN_USERNAME}")
-logger.info(f"🤖 BOT_USERNAME: {BOT_USERNAME}")
-logger.info(f"💰 SEARCH_COST: {SEARCH_COST} | SIGNUP: {SIGNUP_BONUS} | REFERRAL: {REFERRAL_BONUS}")
-logger.info(f"🔗 FORCE_JOIN_ENABLED: {_FJ_ENV_ENABLED}")
-logger.info(f"📢 FORCE_JOIN_CHANNELS: {len(_FJ_ENV_CHANNELS)}")
-for i, ch in enumerate(_FJ_ENV_CHANNELS, 1):
-    logger.info(f"   [{i}] {ch['channel']} → {ch['link']}")
-logger.info("=" * 55)
+_FJ_ENABLED, _FJ_CHANNELS = _load_fj_env()
 
 # ---------- SSL ----------
 _SSL_CTX = ssl.create_default_context()
@@ -235,21 +211,15 @@ ALL_BUTTONS = [
     "🔙 Admin Menu", "🔙 Back to Menu"
 ]
 
-# ---------- JSON Storage ----------
+# ---------- Data ----------
 def _default_data():
-    env_channels = [{"channel": ch["channel"], "link": ch["link"]} for ch in _FJ_ENV_CHANNELS]
     return {
         "users": {},
         "stats": {"total_searches": 0, "searches_today": 0, "last_date": ""},
-        "settings": {
-            "force_join": {
-                "enabled": _FJ_ENV_ENABLED,
-                "channels": env_channels
-            }
-        }
     }
 
 def load_data():
+    """Load data.json — force join is NOT stored here (env only)"""
     default = _default_data()
     if not os.path.exists(DATA_FILE):
         return default
@@ -260,34 +230,19 @@ def load_data():
             raise ValueError("Root is not a dict")
         d.setdefault("users", {})
         d.setdefault("stats", default["stats"])
-        d.setdefault("settings", {})
-        d["settings"].setdefault("force_join", default["settings"]["force_join"])
-        fj = d["settings"]["force_join"]
-        fj.setdefault("enabled", False)
-        if "channels" not in fj:
-            old_ch = fj.get("channel")
-            old_link = fj.get("channel_link")
-            if old_ch:
-                fj["channels"] = [{"channel": old_ch, "link": old_link or ""}]
-            else:
-                fj["channels"] = []
-            fj.pop("channel", None)
-            fj.pop("channel_link", None)
-        if not fj["channels"] and _FJ_ENV_CHANNELS:
-            fj["channels"] = [
-                {"channel": ch["channel"], "link": ch["link"]}
-                for ch in _FJ_ENV_CHANNELS
-            ]
+        # Remove any old force_join settings from data.json
+        if "settings" in d:
+            d["settings"].pop("force_join", None)
         return d
     except Exception as e:
         logger.error(f"Corrupt data.json, resetting... Error: {e}")
         return default
 
-def save_data(data):
+def save_data(d):
     try:
         tmp = DATA_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+            json.dump(d, f, indent=2, ensure_ascii=False)
         os.replace(tmp, DATA_FILE)
     except Exception as e:
         logger.error(f"Save data error: {e}")
@@ -295,7 +250,6 @@ def save_data(data):
 data = load_data()
 users = data["users"]
 stats = data["stats"]
-settings = data["settings"]
 
 _data_lock = threading.RLock()
 
@@ -392,7 +346,7 @@ def handle_referral(new_uid, referrer_id):
         save_data(data)
         return True
 
-# ---------- Bot Init ----------
+# ---------- Bot ----------
 bot = telebot.TeleBot(BOT_TOKEN)
 try: bot.remove_webhook()
 except: pass
@@ -496,20 +450,82 @@ def build_search_frames(prefix="🔒 <b>Username Lookup</b>"):
     frames.append(f"✅ {prefix}\n<code>{progress_bar(100)}</code>")
     return frames
 
-# ================= FORCE JOIN =================
-def get_fj_channels():
-    fj = settings.get("force_join", {})
-    return fj.get("channels", []) or []
+# ============================================================
+# FORCE JOIN — ENV-ONLY LOGIC
+# ============================================================
+
+# Runtime state — validated at startup
+_FJ_ACTIVE = False
+_FJ_VALID_CHANNELS = []      # Only channels where bot is admin
+_FJ_INVALID_CHANNELS = []    # Channels where bot is NOT admin
+
+def _validate_fj_channels_startup():
+    """Check at startup: is bot admin in each channel?
+    If NOT admin → remove from valid list (user can't be checked)
+    If NO valid channels → disable force join
+    """
+    global _FJ_ACTIVE, _FJ_VALID_CHANNELS, _FJ_INVALID_CHANNELS
+
+    if not _FJ_ENABLED:
+        _FJ_ACTIVE = False
+        logger.info("🔓 Force Join: DISABLED (env)")
+        return
+
+    if not _FJ_CHANNELS:
+        _FJ_ACTIVE = False
+        logger.warning("🔓 Force Join: DISABLED (no channels configured)")
+        return
+
+    try:
+        bot_me = bot.get_me()
+    except Exception as e:
+        logger.error(f"❌ Cannot get bot info: {e}")
+        _FJ_ACTIVE = False
+        return
+
+    valid = []
+    invalid = []
+
+    for ch in _FJ_CHANNELS:
+        cid = ch.get("channel")
+        link = ch.get("link", "")
+        try:
+            member = bot.get_chat_member(cid, bot_me.id)
+            status = getattr(member, "status", "")
+            if status in ("administrator", "creator"):
+                valid.append(ch)
+                logger.info(f"   ✅ {cid} — bot is {status}")
+            else:
+                invalid.append(ch)
+                logger.warning(f"   ❌ {cid} — bot is '{status}' (must be admin)")
+        except Exception as e:
+            invalid.append(ch)
+            logger.warning(f"   ❌ {cid} — ERROR: {e}")
+
+    _FJ_VALID_CHANNELS = valid
+    _FJ_INVALID_CHANNELS = invalid
+
+    if valid:
+        _FJ_ACTIVE = True
+        logger.info(f"🔒 Force Join: ENABLED — {len(valid)} channel(s) active")
+    else:
+        _FJ_ACTIVE = False
+        logger.warning(f"🔒 Force Join: DISABLED — bot is not admin in any of {len(_FJ_CHANNELS)} channel(s)")
+
+def get_fj_active_channels():
+    return _FJ_VALID_CHANNELS
 
 def is_user_joined(uid):
-    fj = settings.get("force_join", {})
-    if not fj.get("enabled"):
+    """Return True if user is member of ALL active force-join channels
+    or is admin or force join is off
+    """
+    if not _FJ_ACTIVE:
         return True
-    channels = get_fj_channels()
-    if not channels:
-        return True
-    # ⭐ ALL ADMINS BYPASS
     if is_admin(uid):
+        return True
+
+    channels = get_fj_active_channels()
+    if not channels:
         return True
 
     for ch in channels:
@@ -523,14 +539,18 @@ def is_user_joined(uid):
                 continue
             if status == "restricted" and getattr(member, "is_member", False):
                 continue
+            # Not a member of this channel
             return False
         except Exception as e:
-            logger.warning(f"ForceJoin check FAILED for uid={uid} on {cid}: {e}")
-            continue
+            # ⭐ FAIL-OPEN: if can't check (e.g. user never interacted with channel),
+            # treat as not joined — but log warning
+            logger.warning(f"FJ check error uid={uid} ch={cid}: {e}")
+            return False
+
     return True
 
 def build_join_kb():
-    channels = get_fj_channels()
+    channels = get_fj_active_channels()
     kb = InlineKeyboardMarkup(row_width=1)
     for i, ch in enumerate(channels[:10], 1):
         link = ch.get("link") or ""
@@ -544,7 +564,7 @@ def build_join_kb():
 def ensure_joined(uid, cid, reply_to=None):
     if is_user_joined(uid):
         return True
-    channels = get_fj_channels()
+    channels = get_fj_active_channels()
     if not channels:
         return True
     try:
@@ -577,7 +597,24 @@ def cb_check_join(c):
             )
         except: pass
     else:
-        bot.answer_callback_query(c.id, "❌ Kuch channels join nahi kiye!", show_alert=True)
+        # Show which channel is missing
+        channels = get_fj_active_channels()
+        missing = []
+        for ch in channels:
+            cid = ch.get("channel")
+            try:
+                member = bot.get_chat_member(cid, uid)
+                status = getattr(member, "status", "")
+                if status not in ("member", "administrator", "creator"):
+                    missing.append(ch.get("link") or str(cid))
+            except:
+                missing.append(ch.get("link") or str(cid))
+
+        if missing:
+            txt = "❌ Ye channels abhi join nahi kiye:\n" + "\n".join(f"• {m}" for m in missing[:5])
+        else:
+            txt = "❌ Kuch channels join nahi kiye!"
+        bot.answer_callback_query(c.id, txt, show_alert=True)
 
 @bot.callback_query_handler(func=lambda c: c.data == "noop")
 def cb_noop(c):
@@ -600,13 +637,6 @@ def admin_kb():
     kb.row(KeyboardButton("🔙 Back to Menu"))
     return kb
 
-def force_join_kb():
-    kb = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
-    kb.row(KeyboardButton("🔧 Set Channel"), KeyboardButton("🔗 Set Invite Link"))
-    kb.row(KeyboardButton("⚙️ Toggle Force Join"))
-    kb.row(KeyboardButton("🔙 Admin Menu"))
-    return kb
-
 def credit_mgr_kb():
     kb = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     kb.row(KeyboardButton("➕ Add Credits"), KeyboardButton("➖ Remove Credits"))
@@ -615,24 +645,30 @@ def credit_mgr_kb():
     return kb
 
 def force_join_status_text():
-    fj = settings.get("force_join", {})
-    status = "🟢 ENABLED" if fj.get("enabled") else "🔴 DISABLED"
-    channels = get_fj_channels()
     lines = [
-        f"🔗 <b>Force Join Settings</b>",
+        f"🔗 <b>Force Join Status</b>",
         f"",
-        f"Status: <b>{status}</b>",
-        f"Channels: <b>{len(channels)}</b>",
+        f"Env Enabled: <b>{_FJ_ENABLED}</b>",
+        f"Runtime Active: <b>{_FJ_ACTIVE}</b>",
         f"",
     ]
-    if channels:
-        for i, ch in enumerate(channels, 1):
-            lines.append(f"<b>{i}.</b> <code>{esc(ch.get('channel'))}</code>")
+    if _FJ_VALID_CHANNELS:
+        lines.append(f"<b>✅ Active Channels ({len(_FJ_VALID_CHANNELS)}):</b>")
+        for i, ch in enumerate(_FJ_VALID_CHANNELS, 1):
+            lines.append(f"  {i}. <code>{esc(ch.get('channel'))}</code>")
             if ch.get("link"):
-                lines.append(f"   🔗 {esc(ch.get('link'))}")
+                lines.append(f"     🔗 {esc(ch.get('link'))}")
     else:
-        lines.append("<i>No channels set</i>")
+        lines.append("<i>No active channels</i>")
+
+    if _FJ_INVALID_CHANNELS:
+        lines.append(f"")
+        lines.append(f"<b>❌ Invalid ({len(_FJ_INVALID_CHANNELS)}) — bot not admin:</b>")
+        for i, ch in enumerate(_FJ_INVALID_CHANNELS, 1):
+            lines.append(f"  {i}. <code>{esc(ch.get('channel'))}</code>")
+
     lines.append("")
+    lines.append("<i>Force join env se control hota hai. Bot admin hona chahiye channel me.</i>")
     return "\n".join(lines)
 
 # ================= CORE LOOKUP =================
@@ -748,10 +784,24 @@ def cmd_id(m):
         f"<b>Your ID:</b> <code>{uid}</code>\n"
         f"<b>Username:</b> @{esc(uname)}\n"
         f"<b>Admin?:</b> {is_adm}\n"
-        f"<b>Force Join:</b> {is_fj}\n\n"
+        f"<b>Force Join:</b> {is_fj}\n"
+        f"<b>FJ Active:</b> {_FJ_ACTIVE}\n\n"
         f"<b>Configured Admins ({len(ADMIN_IDS)}):</b>\n{admins_list}",
         parse_mode='HTML'
     )
+
+@bot.message_handler(commands=['fjdebug'])
+def cmd_fjdebug(m):
+    if not is_admin(m.from_user.id): return
+    if m.chat.type != 'private': return
+    bot.reply_to(m, force_join_status_text(), parse_mode='HTML')
+
+@bot.message_handler(commands=['fjreload'])
+def cmd_fjreload(m):
+    if not is_admin(m.from_user.id): return
+    if m.chat.type != 'private': return
+    _validate_fj_channels_startup()
+    bot.reply_to(m, "🔄 Force join reloaded.\n\n" + force_join_status_text(), parse_mode='HTML')
 
 @bot.message_handler(commands=['start'])
 def cmd_start(m):
@@ -833,8 +883,6 @@ def btn_admin(m):
 
 @bot.message_handler(func=lambda m: m.text == "📊 Dashboard" and m.chat.type == 'private' and is_admin(m.from_user.id))
 def btn_dashboard(m):
-    fj = settings.get("force_join", {})
-    ch_count = len(get_fj_channels())
     admins_list = "\n".join(f"  {i}. <code>{a}</code>" for i, a in enumerate(ADMIN_IDS, 1))
     txt = (
         f"📊 <b>Dashboard</b>\n\n"
@@ -842,8 +890,8 @@ def btn_dashboard(m):
         f"🔥 Active (24h): <b>{active_users_24h()}</b>\n"
         f"🔍 Total Searches: <b>{total_searches()}</b>\n"
         f"📅 Searches Today: <b>{searches_today()}</b>\n\n"
-        f"🔗 Force Join: <b>{'🟢 ON' if fj.get('enabled') else '🔴 OFF'}</b>\n"
-        f"📢 Channels: <b>{ch_count}</b>\n\n"
+        f"🔒 Force Join: <b>{'🟢 ON' if _FJ_ACTIVE else '🔴 OFF'}</b>\n"
+        f"📢 Active Channels: <b>{len(_FJ_VALID_CHANNELS)}</b>\n\n"
         f"👑 Admins ({len(ADMIN_IDS)}):\n{admins_list}"
     )
     bot.reply_to(m, txt, parse_mode='HTML')
@@ -874,89 +922,7 @@ def btn_back(m):
 
 @bot.message_handler(func=lambda m: m.text == "🔗 Force Join" and m.chat.type == 'private' and is_admin(m.from_user.id))
 def btn_force_join(m):
-    bot.reply_to(m, force_join_status_text(), parse_mode='HTML', reply_markup=force_join_kb())
-
-@bot.message_handler(func=lambda m: m.text == "🔧 Set Channel" and m.chat.type == 'private' and is_admin(m.from_user.id))
-def btn_set_channel(m):
-    msg = bot.reply_to(
-        m,
-        "Send channel username (e.g. <code>@mychannel</code>) or numeric ID "
-        "(e.g. <code>-1001234567890</code>).\n\n"
-        "<i>Adds a new channel to the list.</i>",
-        parse_mode='HTML'
-    )
-    bot.register_next_step_handler(msg, do_set_channel)
-
-def do_set_channel(m):
-    if m.text in ALL_BUTTONS:
-        bot.reply_to(m, "❌ Cancelled.", reply_markup=force_join_kb()); return
-    val = m.text.strip()
-    if not (val.startswith("@") or val.lstrip("-").isdigit()):
-        bot.reply_to(m, "❌ Invalid format. Use @username or numeric channel ID.")
-        return
-    try:
-        chat = bot.get_chat(val)
-        settings["force_join"].setdefault("channels", [])
-        link = ""
-        if chat.username:
-            link = f"https://t.me/{chat.username}"
-        settings["force_join"]["channels"].append({"channel": val, "link": link})
-        save_data(data)
-        bot.reply_to(
-            m,
-            f"✅ Channel added: <code>{esc(val)}</code>\n"
-            f"📛 Title: {esc(chat.title or '')}\n"
-            f"🔗 Link: {esc(link or '—')}",
-            parse_mode='HTML', reply_markup=force_join_kb()
-        )
-    except Exception as e:
-        bot.reply_to(
-            m,
-            f"❌ Could not access channel: <code>{esc(str(e))}</code>\n\n"
-            f"Make sure bot is added as admin in that channel.",
-            parse_mode='HTML'
-        )
-
-@bot.message_handler(func=lambda m: m.text == "🔗 Set Invite Link" and m.chat.type == 'private' and is_admin(m.from_user.id))
-def btn_set_link(m):
-    msg = bot.reply_to(
-        m,
-        "Send the invite link for the LAST added channel "
-        "(e.g. <code>https://t.me/+AbCdEf123</code>):",
-        parse_mode='HTML'
-    )
-    bot.register_next_step_handler(msg, do_set_link)
-
-def do_set_link(m):
-    if m.text in ALL_BUTTONS:
-        bot.reply_to(m, "❌ Cancelled.", reply_markup=force_join_kb()); return
-    val = m.text.strip()
-    if not val.startswith("http"):
-        bot.reply_to(m, "❌ Invalid link. Must start with http/https.")
-        return
-    chs = settings["force_join"].get("channels", [])
-    if not chs:
-        bot.reply_to(m, "❌ No channel added yet. Use 🔧 Set Channel first.")
-        return
-    chs[-1]["link"] = val
-    save_data(data)
-    bot.reply_to(m, f"✅ Invite link saved:\n<code>{esc(val)}</code>", parse_mode='HTML', reply_markup=force_join_kb())
-
-@bot.message_handler(func=lambda m: m.text == "⚙️ Toggle Force Join" and m.chat.type == 'private' and is_admin(m.from_user.id))
-def btn_toggle_fj(m):
-    fj = settings["force_join"]
-    chs = fj.get("channels", [])
-    if not chs:
-        bot.reply_to(m, "⚠️ Pehle channel set karein (🔧 Set Channel).", reply_markup=force_join_kb())
-        return
-    fj["enabled"] = not fj.get("enabled", False)
-    save_data(data)
-    bot.reply_to(
-        m,
-        f"{'🟢 Force Join ENABLED' if fj['enabled'] else '🔴 Force Join DISABLED'}\n"
-        f"📢 Channels: {len(chs)}",
-        reply_markup=force_join_kb()
-    )
+    bot.reply_to(m, force_join_status_text(), parse_mode='HTML')
 
 @bot.message_handler(func=lambda m: m.text == "💰 Credit Manager" and m.chat.type == 'private' and is_admin(m.from_user.id))
 def btn_credit_mgr(m):
@@ -1129,6 +1095,24 @@ def private_text_handler(m):
 
 # ================= ENTRY =================
 if __name__ == "__main__":
+    logger.info("=" * 55)
+    logger.info("🚀 STARTING BOT v8 ULTIMATE FORCE JOIN")
+    logger.info(f"👑 Total Admins: {len(ADMIN_IDS)}")
+    for i, aid in enumerate(ADMIN_IDS, 1):
+        logger.info(f"   [{i}] {aid}")
+    logger.info(f"📞 ADMIN_USERNAME: {ADMIN_USERNAME}")
+    logger.info(f"🤖 BOT_USERNAME: {BOT_USERNAME}")
+    logger.info(f"💰 SEARCH_COST: {SEARCH_COST}")
+    logger.info(f"🔗 FORCE_JOIN_ENABLED (env): {_FJ_ENABLED}")
+    logger.info(f"📢 FORCE_JOIN_CHANNELS (env): {len(_FJ_CHANNELS)}")
+    logger.info("=" * 55)
+
+    # ⭐ VALIDATE FORCE JOIN AT STARTUP
+    logger.info("🔍 Validating force join channels...")
+    _validate_fj_channels_startup()
+    logger.info(f"🔒 Force Join Runtime: {'ACTIVE' if _FJ_ACTIVE else 'INACTIVE'}")
+    logger.info("=" * 55)
+
     try:
         bot.infinity_polling(timeout=60, long_polling_timeout=30)
     except KeyboardInterrupt:
