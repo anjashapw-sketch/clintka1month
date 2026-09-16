@@ -1,16 +1,10 @@
 """
-Username Info Bot — DEEP LOGIC EDITION (v4.1 - FIXED)
+Username Info Bot — DEEP LOGIC EDITION (v4.2 - URLLIB EDITION)
++ No external requests module needed (uses built-in urllib)
 + Group me bilkul chup (koi reply nahi)
 + Force Join System (Enable/Disable, Channel, Invite Link)
 + Credit Management (Add/Remove/Set/Check User)
-- Only Username & Numeric ID to Info (TG2Num API)
-- Smart Fallback: Agar username resolve na ho toh Numeric ID maange
-- Credit Safety: Sirf successful API call par credits deduct
-- JSON storage (No MongoDB)
-- Signup: 30 credits | Referral: 10 credits (dono ko) | Search: 10 credits
-+ Safe dotenv import (crash-proof)
-+ Atomic credit deductions
-+ HTML-safe broadcast
++ JSON storage (No MongoDB)
 """
 
 import os, sys, re, json, time, threading, html
@@ -22,12 +16,16 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    # python-dotenv not installed — using system env vars
     pass
 except Exception:
     pass
 
-import requests
+# ---------- Built-in HTTP (no external module) ----------
+import urllib.request
+import urllib.parse
+import urllib.error
+import ssl
+
 import telebot
 from telebot.types import (
     ReplyKeyboardMarkup, KeyboardButton,
@@ -67,6 +65,36 @@ REFERRAL_BONUS = int(os.getenv("REFERRAL_BONUS", 10))
 if not BOT_TOKEN:
     logger.critical("❌ BOT_TOKEN missing in environment")
     sys.exit(1)
+
+# ---------- SSL Context (bypass cert issues on some hosts) ----------
+_SSL_CTX = ssl.create_default_context()
+_SSL_CTX.check_hostname = False
+_SSL_CTX.verify_mode = ssl.CERT_NONE
+
+def http_get_json(url, timeout=15):
+    """Built-in HTTP GET with JSON response. Returns (status_code, data_or_None, error_msg)"""
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; Bot/1.0)",
+                "Accept": "application/json"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as resp:
+            status_code = resp.status
+            raw = resp.read().decode("utf-8", errors="replace")
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            return status_code, None, f"Invalid JSON: {e}"
+        return status_code, data, None
+    except urllib.error.HTTPError as e:
+        return e.code, None, f"HTTPError {e.code}"
+    except urllib.error.URLError as e:
+        return 0, None, f"URLError: {e.reason}"
+    except Exception as e:
+        return 0, None, f"Unexpected: {e}"
 
 # ---------- All Button Texts ----------
 ALL_BUTTONS = [
@@ -127,7 +155,6 @@ users = data["users"]
 stats = data["stats"]
 settings = data["settings"]
 
-# ---------- Thread Lock for data safety ----------
 _data_lock = threading.RLock()
 
 def get_user(uid):
@@ -156,7 +183,6 @@ def add_credits(uid, amount):
         save_data(data)
 
 def deduct_credits(uid, amount):
-    """Atomic deduction with floor at 0"""
     uid_str = str(uid)
     with _data_lock:
         if uid_str not in users:
@@ -203,7 +229,6 @@ def searches_today():
     if stats.get("last_date") != today: return 0
     return stats.get("searches_today", 0)
 
-# ---------- Referral Logic ----------
 def handle_referral(new_uid, referrer_id):
     if new_uid == referrer_id: return False
     new_uid_str = str(new_uid)
@@ -244,9 +269,7 @@ def rate_ok(uid):
         _last_call[uid] = now_t
         return True
 
-# ---------- HTML Escape Helper ----------
 def esc(s):
-    """Safely escape user/admin text for HTML parse mode"""
     if s is None: return ""
     return html.escape(str(s), quote=False)
 
@@ -331,7 +354,7 @@ def build_search_frames(prefix="🔒 <b>Username Lookup</b>"):
     frames.append(f"✅ {prefix}\n<code>{progress_bar(100)}</code>")
     return frames
 
-# ================= FORCE JOIN DEEP LOGIC =================
+# ================= FORCE JOIN =================
 def is_user_joined(uid):
     fj = settings.get("force_join", {})
     if not fj.get("enabled") or not fj.get("channel"):
@@ -437,7 +460,7 @@ def force_join_status_text():
         f"<i>Note: Bot ko channel me admin hona chahiye warna verification fail hoga.</i>"
     )
 
-# ================= CORE: USERNAME & ID LOOKUP =================
+# ================= CORE: USERNAME & ID LOOKUP (urllib) =================
 def process_tg2num(uid, cid, query, reply_to=None):
     query = query.strip()
     if not query:
@@ -485,14 +508,20 @@ def process_tg2num(uid, cid, query, reply_to=None):
             )
             return
 
-    try:
-        resp = requests.get(f"{TG2NUM_API_URL}{tg_id}", timeout=15)
-        if resp.status_code != 200:
-            am.stop(); am.edit(f"⚠️ API Error ({resp.status_code})"); return
-        api_data = resp.json()
-    except Exception as e:
-        logger.error(f"TG2Num API error: {e}")
-        am.stop(); am.edit("⚠️ API Unreachable"); return
+    # ⭐ urllib based API call (no external requests)
+    api_url = f"{TG2NUM_API_URL}{tg_id}"
+    status_code, api_data, err = http_get_json(api_url, timeout=15)
+
+    if err or status_code == 0:
+        logger.error(f"TG2Num error: {err}")
+        am.stop(); am.edit(f"⚠️ API Unreachable\n<code>{esc(err or 'unknown')}</code>"); return
+
+    if status_code != 200:
+        logger.error(f"TG2Num HTTP {status_code}")
+        am.stop(); am.edit(f"⚠️ API Error ({status_code})"); return
+
+    if not isinstance(api_data, dict):
+        am.stop(); am.edit("⚠️ API returned invalid data"); return
 
     if api_data.get("success") and api_data.get("result"):
         r = api_data["result"]
@@ -507,16 +536,14 @@ def process_tg2num(uid, cid, query, reply_to=None):
             f"🌍 <b>Country:</b> {esc(country)}\n"
         )
 
-        # Only deduct if API actually returned data AND user is not admin
         if not is_admin:
             if deduct_credits(uid, SEARCH_COST):
                 text += f"\n💎 Credits left: {get_credits(uid)}"
             else:
-                # Edge case: credits dried between check and deduct
                 am.stop(); am.delete()
                 bot.send_message(
                     cid,
-                    "⚠️ Credits deduction failed (balance too low). Please try again.",
+                    "⚠️ Credits deduction failed. Please try again.",
                     reply_to_message_id=reply_to
                 )
                 return
@@ -531,7 +558,6 @@ def process_tg2num(uid, cid, query, reply_to=None):
 # ================= HANDLERS =================
 @bot.message_handler(commands=['start'])
 def cmd_start(m):
-    # 🔥 STRICT GUARD: Group me bilkul chup raho
     if m.chat.type != 'private':
         return
 
@@ -604,7 +630,6 @@ def btn_buy(m):
 def btn_about(m):
     bot.reply_to(m, f"ℹ️ Username Info Bot\n{esc(BOT_USERNAME)}")
 
-# ---------- Admin Panel (DM only) ----------
 @bot.message_handler(func=lambda m: m.text == "👑 Admin Panel" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
 def btn_admin(m):
     bot.reply_to(m, "👑 <b>Admin Panel</b>", parse_mode='HTML', reply_markup=admin_kb())
@@ -632,10 +657,7 @@ def do_broadcast(m):
         bot.reply_to(m, "❌ Broadcast cancelled."); return
     text = m.text
     if not text: return
-
-    # Escape text for HTML to avoid parse errors
     safe_text = esc(text)
-
     success = 0
     for uid_str in list(users.keys()):
         try:
@@ -649,7 +671,6 @@ def do_broadcast(m):
 def btn_back(m):
     bot.reply_to(m, "🏠 Main Menu", reply_markup=main_kb(ADMIN_ID))
 
-# ================= FORCE JOIN ADMIN HANDLERS =================
 @bot.message_handler(func=lambda m: m.text == "🔗 Force Join" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
 def btn_force_join(m):
     bot.reply_to(m, force_join_status_text(), parse_mode='HTML', reply_markup=force_join_kb())
@@ -723,7 +744,6 @@ def btn_toggle_fj(m):
         reply_markup=force_join_kb()
     )
 
-# ================= CREDIT MANAGER ADMIN HANDLERS =================
 @bot.message_handler(func=lambda m: m.text == "💰 Credit Manager" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
 def btn_credit_mgr(m):
     bot.reply_to(m, "💰 <b>Credit Manager</b>\n\nChoose an action:", parse_mode='HTML', reply_markup=credit_mgr_kb())
@@ -870,7 +890,7 @@ def do_check_user(m):
 def btn_admin_menu(m):
     bot.reply_to(m, "👑 <b>Admin Panel</b>", parse_mode='HTML', reply_markup=admin_kb())
 
-# ================= PRIVATE CHAT HANDLER (MAIN LOOKUP) =================
+# ================= PRIVATE CHAT HANDLER =================
 @bot.message_handler(func=lambda m: m.chat.type == 'private' and m.content_type == 'text' and not m.text.startswith('/'))
 def private_text_handler(m):
     uid = m.from_user.id
@@ -896,7 +916,7 @@ def private_text_handler(m):
 
 # ================= ENTRY =================
 if __name__ == "__main__":
-    logger.info("🚀 Bot starting (DEEP LOGIC EDITION v4.1 FIXED)...")
+    logger.info("🚀 Bot starting (v4.2 URLLIB EDITION)...")
     logger.info(f"👑 Admin ID: {ADMIN_ID}")
     logger.info(f"📞 Admin contact: {ADMIN_USERNAME}")
     logger.info(f"🔗 Force Join: {'ON' if settings['force_join'].get('enabled') else 'OFF'}")
