@@ -1,10 +1,10 @@
 """
-Username Info Bot — v6 FIXED
-+ Quotes-free .env support
+Username Info Bot — v7 MULTI ADMIN
++ 2+ admins support (ADMIN_ID, ADMIN_ID_2, ADMIN_ID_3, ...)
++ Quotes-free .env
 + /id command for debugging
-+ Multi force join (3 channels)
++ Multi force join (3+ channels)
 + Auto-install missing modules
-+ Better startup logging
 """
 
 import os, sys, subprocess, time
@@ -98,27 +98,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger("username_info_bot")
 
-# ---------- Helper: clean env value (strips quotes & whitespace) ----------
+# ---------- Helper: clean env value ----------
 def _clean_env(key, default=""):
-    """Get env var and strip quotes/whitespace"""
     val = os.getenv(key, default)
     if val is None:
         return default
     val = str(val).strip()
-    # Strip surrounding quotes
     if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
         val = val[1:-1]
     return val
 
 # ---------- Config ----------
 BOT_TOKEN = _clean_env("BOT_TOKEN")
-_admin_id_raw = _clean_env("ADMIN_ID", "0")
-try:
-    ADMIN_ID = int(_admin_id_raw)
-except ValueError:
-    logger.critical(f"❌ ADMIN_ID is not a valid number: '{_admin_id_raw}'")
-    sys.exit(1)
-
 BOT_USERNAME = _clean_env("BOT_USERNAME", "@YourBot")
 ADMIN_USERNAME = _clean_env("ADMIN_USERNAME", "@admin")
 
@@ -133,19 +124,50 @@ except ValueError as e:
     logger.critical(f"❌ Invalid numeric config: {e}")
     sys.exit(1)
 
+# ⭐ MULTI ADMIN LOADING
+def _load_admin_ids():
+    """Load ADMIN_ID, ADMIN_ID_2, ..., ADMIN_ID_10"""
+    ids = []
+    # Primary
+    primary = _clean_env("ADMIN_ID", "")
+    if primary:
+        try:
+            ids.append(int(primary))
+        except ValueError:
+            logger.warning(f"⚠️ Invalid ADMIN_ID: {primary}")
+    # Secondary
+    for i in range(2, 11):
+        v = _clean_env(f"ADMIN_ID_{i}", "")
+        if v:
+            try:
+                uid = int(v)
+                if uid not in ids:
+                    ids.append(uid)
+            except ValueError:
+                logger.warning(f"⚠️ Invalid ADMIN_ID_{i}: {v}")
+    return ids
+
+ADMIN_IDS = _load_admin_ids()
+ADMIN_ID = ADMIN_IDS[0] if ADMIN_IDS else 0  # primary
+
+def is_admin(uid):
+    """Check if user is admin (any of them)"""
+    return uid in ADMIN_IDS
+
+# ---------- Config Validation ----------
 if not BOT_TOKEN:
     logger.critical("❌ BOT_TOKEN missing in environment")
     sys.exit(1)
 
-if ADMIN_ID == 0:
-    logger.warning("⚠️ ADMIN_ID is 0 — no admin will be recognized!")
+if not ADMIN_IDS:
+    logger.warning("⚠️ No admins configured — nobody can access admin panel!")
 
 # ---------- Force Join Env ----------
 def _load_force_join_env():
     enabled_raw = _clean_env("FORCE_JOIN_ENABLED", "false").lower()
     enabled = enabled_raw in ("true", "1", "yes", "on")
     channels = []
-    for i in (1, 2, 3, 4, 5):
+    for i in range(1, 11):
         cid = _clean_env(f"FORCE_JOIN_CHANNEL_{i}")
         link = _clean_env(f"FORCE_JOIN_LINK_{i}")
         if cid:
@@ -161,8 +183,10 @@ _FJ_ENV_ENABLED, _FJ_ENV_CHANNELS = _load_force_join_env()
 
 # ---------- Startup Log ----------
 logger.info("=" * 55)
-logger.info("🚀 STARTING BOT v6")
-logger.info(f"👑 ADMIN_ID: {ADMIN_ID} ({type(ADMIN_ID).__name__})")
+logger.info("🚀 STARTING BOT v7 (MULTI ADMIN)")
+logger.info(f"👑 Total Admins: {len(ADMIN_IDS)}")
+for i, aid in enumerate(ADMIN_IDS, 1):
+    logger.info(f"   [{i}] {aid}")
 logger.info(f"📞 ADMIN_USERNAME: {ADMIN_USERNAME}")
 logger.info(f"🤖 BOT_USERNAME: {BOT_USERNAME}")
 logger.info(f"💰 SEARCH_COST: {SEARCH_COST} | SIGNUP: {SIGNUP_BONUS} | REFERRAL: {REFERRAL_BONUS}")
@@ -249,7 +273,6 @@ def load_data():
                 fj["channels"] = []
             fj.pop("channel", None)
             fj.pop("channel_link", None)
-        # If DB has no channels but env does, seed from env
         if not fj["channels"] and _FJ_ENV_CHANNELS:
             fj["channels"] = [
                 {"channel": ch["channel"], "link": ch["link"]}
@@ -378,7 +401,7 @@ except: pass
 _rate_lock = threading.Lock()
 _last_call = {}
 def rate_ok(uid):
-    if uid == ADMIN_ID: return True
+    if is_admin(uid): return True
     now_t = time.time()
     with _rate_lock:
         if len(_last_call) > 10000:
@@ -479,15 +502,15 @@ def get_fj_channels():
     return fj.get("channels", []) or []
 
 def is_user_joined(uid):
-    """Returns True if user has joined all required channels (or admin)"""
     fj = settings.get("force_join", {})
     if not fj.get("enabled"):
         return True
     channels = get_fj_channels()
     if not channels:
         return True
-    if uid == ADMIN_ID:
-        return True  # ⭐ ADMIN ALWAYS BYPASSES
+    # ⭐ ALL ADMINS BYPASS
+    if is_admin(uid):
+        return True
 
     for ch in channels:
         cid = ch.get("channel")
@@ -500,10 +523,9 @@ def is_user_joined(uid):
                 continue
             if status == "restricted" and getattr(member, "is_member", False):
                 continue
-            return False  # Not joined this channel
+            return False
         except Exception as e:
             logger.warning(f"ForceJoin check FAILED for uid={uid} on {cid}: {e}")
-            # ⭐ If check fails (bot not admin), fail OPEN so users aren't blocked
             continue
     return True
 
@@ -565,7 +587,7 @@ def cb_noop(c):
 def main_kb(uid):
     kb = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     kb.row(KeyboardButton("🔒 Username To Info"), KeyboardButton("🛒 Buy Credits"))
-    if uid == ADMIN_ID:
+    if is_admin(uid):
         kb.row(KeyboardButton("👤 My Profile"), KeyboardButton("👑 Admin Panel"))
     else:
         kb.row(KeyboardButton("👤 My Profile"), KeyboardButton("ℹ️ About"))
@@ -611,7 +633,6 @@ def force_join_status_text():
     else:
         lines.append("<i>No channels set</i>")
     lines.append("")
-    lines.append("<i>Env se load hote hain. Admin panel se add/remove karo.</i>")
     return "\n".join(lines)
 
 # ================= CORE LOOKUP =================
@@ -623,9 +644,9 @@ def process_tg2num(uid, cid, query, reply_to=None):
     if not ensure_joined(uid, cid, reply_to):
         return
 
-    is_admin = (uid == ADMIN_ID)
+    user_is_admin = is_admin(uid)
 
-    if not is_admin and get_credits(uid) < SEARCH_COST:
+    if not user_is_admin and get_credits(uid) < SEARCH_COST:
         bot.send_message(
             cid,
             f"⚠️ Not enough credits.\n🔎 Cost: {SEARCH_COST}\n"
@@ -689,7 +710,7 @@ def process_tg2num(uid, cid, query, reply_to=None):
             f"🌍 <b>Country:</b> {esc(country)}\n"
         )
 
-        if not is_admin:
+        if not user_is_admin:
             if deduct_credits(uid, SEARCH_COST):
                 text += f"\n💎 Credits left: {get_credits(uid)}"
             else:
@@ -711,24 +732,24 @@ def process_tg2num(uid, cid, query, reply_to=None):
 # ================= HANDLERS =================
 @bot.message_handler(commands=['id', 'myid', 'whoami'])
 def cmd_id(m):
-    """Debug command — shows user their Telegram ID and admin status"""
     if m.chat.type != 'private':
         return
     uid = m.from_user.id
     uname = m.from_user.username or "no_username"
-    is_adm = "✅ YES" if uid == ADMIN_ID else "❌ NO"
+    is_adm = "✅ YES" if is_admin(uid) else "❌ NO"
     try:
         is_fj = "✅ JOINED" if is_user_joined(uid) else "❌ NOT JOINED"
     except:
         is_fj = "⚠️ ERROR"
+    admins_list = "\n".join(f"  {i}. <code>{a}</code>" for i, a in enumerate(ADMIN_IDS, 1)) or "  <i>none</i>"
     bot.reply_to(
         m,
         f"🆔 <b>Your Telegram Info</b>\n\n"
         f"<b>Your ID:</b> <code>{uid}</code>\n"
         f"<b>Username:</b> @{esc(uname)}\n"
         f"<b>Admin?:</b> {is_adm}\n"
-        f"<b>Config ADMIN_ID:</b> <code>{ADMIN_ID}</code>\n"
-        f"<b>Force Join:</b> {is_fj}",
+        f"<b>Force Join:</b> {is_fj}\n\n"
+        f"<b>Configured Admins ({len(ADMIN_IDS)}):</b>\n{admins_list}",
         parse_mode='HTML'
     )
 
@@ -753,7 +774,7 @@ def cmd_start(m):
     user["last_seen"] = datetime.now().isoformat()
     save_data(data)
 
-    credits_display = '♾️' if uid == ADMIN_ID else get_credits(uid)
+    credits_display = '♾️' if is_admin(uid) else get_credits(uid)
     bot.reply_to(
         m,
         f"👋 <b>Welcome!</b>\n\n"
@@ -782,7 +803,7 @@ def btn_profile(m):
     user = get_user(uid)
     user["last_seen"] = datetime.now().isoformat()
     save_data(data)
-    credits_display = '♾️' if uid == ADMIN_ID else user.get('credits', 0)
+    credits_display = '♾️' if is_admin(uid) else user.get('credits', 0)
     bot.reply_to(
         m,
         f"👤 <b>Your Profile</b>\n\n"
@@ -806,14 +827,15 @@ def btn_buy(m):
 def btn_about(m):
     bot.reply_to(m, f"ℹ️ Username Info Bot\n{esc(BOT_USERNAME)}")
 
-@bot.message_handler(func=lambda m: m.text == "👑 Admin Panel" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
+@bot.message_handler(func=lambda m: m.text == "👑 Admin Panel" and m.chat.type == 'private' and is_admin(m.from_user.id))
 def btn_admin(m):
     bot.reply_to(m, "👑 <b>Admin Panel</b>", parse_mode='HTML', reply_markup=admin_kb())
 
-@bot.message_handler(func=lambda m: m.text == "📊 Dashboard" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
+@bot.message_handler(func=lambda m: m.text == "📊 Dashboard" and m.chat.type == 'private' and is_admin(m.from_user.id))
 def btn_dashboard(m):
     fj = settings.get("force_join", {})
     ch_count = len(get_fj_channels())
+    admins_list = "\n".join(f"  {i}. <code>{a}</code>" for i, a in enumerate(ADMIN_IDS, 1))
     txt = (
         f"📊 <b>Dashboard</b>\n\n"
         f"👥 Total Users: <b>{total_users()}</b>\n"
@@ -821,11 +843,12 @@ def btn_dashboard(m):
         f"🔍 Total Searches: <b>{total_searches()}</b>\n"
         f"📅 Searches Today: <b>{searches_today()}</b>\n\n"
         f"🔗 Force Join: <b>{'🟢 ON' if fj.get('enabled') else '🔴 OFF'}</b>\n"
-        f"📢 Channels: <b>{ch_count}</b>"
+        f"📢 Channels: <b>{ch_count}</b>\n\n"
+        f"👑 Admins ({len(ADMIN_IDS)}):\n{admins_list}"
     )
     bot.reply_to(m, txt, parse_mode='HTML')
 
-@bot.message_handler(func=lambda m: m.text == "📢 Broadcast" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
+@bot.message_handler(func=lambda m: m.text == "📢 Broadcast" and m.chat.type == 'private' and is_admin(m.from_user.id))
 def btn_broadcast(m):
     msg = bot.reply_to(m, "Send the message to broadcast to all users:")
     bot.register_next_step_handler(msg, do_broadcast)
@@ -845,15 +868,15 @@ def do_broadcast(m):
         except: pass
     bot.reply_to(m, f"✅ Broadcast sent to {success}/{len(users)} users.")
 
-@bot.message_handler(func=lambda m: m.text == "🔙 Back to Menu" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
+@bot.message_handler(func=lambda m: m.text == "🔙 Back to Menu" and m.chat.type == 'private' and is_admin(m.from_user.id))
 def btn_back(m):
-    bot.reply_to(m, "🏠 Main Menu", reply_markup=main_kb(ADMIN_ID))
+    bot.reply_to(m, "🏠 Main Menu", reply_markup=main_kb(m.from_user.id))
 
-@bot.message_handler(func=lambda m: m.text == "🔗 Force Join" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
+@bot.message_handler(func=lambda m: m.text == "🔗 Force Join" and m.chat.type == 'private' and is_admin(m.from_user.id))
 def btn_force_join(m):
     bot.reply_to(m, force_join_status_text(), parse_mode='HTML', reply_markup=force_join_kb())
 
-@bot.message_handler(func=lambda m: m.text == "🔧 Set Channel" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
+@bot.message_handler(func=lambda m: m.text == "🔧 Set Channel" and m.chat.type == 'private' and is_admin(m.from_user.id))
 def btn_set_channel(m):
     msg = bot.reply_to(
         m,
@@ -894,7 +917,7 @@ def do_set_channel(m):
             parse_mode='HTML'
         )
 
-@bot.message_handler(func=lambda m: m.text == "🔗 Set Invite Link" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
+@bot.message_handler(func=lambda m: m.text == "🔗 Set Invite Link" and m.chat.type == 'private' and is_admin(m.from_user.id))
 def btn_set_link(m):
     msg = bot.reply_to(
         m,
@@ -919,7 +942,7 @@ def do_set_link(m):
     save_data(data)
     bot.reply_to(m, f"✅ Invite link saved:\n<code>{esc(val)}</code>", parse_mode='HTML', reply_markup=force_join_kb())
 
-@bot.message_handler(func=lambda m: m.text == "⚙️ Toggle Force Join" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
+@bot.message_handler(func=lambda m: m.text == "⚙️ Toggle Force Join" and m.chat.type == 'private' and is_admin(m.from_user.id))
 def btn_toggle_fj(m):
     fj = settings["force_join"]
     chs = fj.get("channels", [])
@@ -935,11 +958,11 @@ def btn_toggle_fj(m):
         reply_markup=force_join_kb()
     )
 
-@bot.message_handler(func=lambda m: m.text == "💰 Credit Manager" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
+@bot.message_handler(func=lambda m: m.text == "💰 Credit Manager" and m.chat.type == 'private' and is_admin(m.from_user.id))
 def btn_credit_mgr(m):
     bot.reply_to(m, "💰 <b>Credit Manager</b>\n\nChoose an action:", parse_mode='HTML', reply_markup=credit_mgr_kb())
 
-@bot.message_handler(func=lambda m: m.text == "➕ Add Credits" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
+@bot.message_handler(func=lambda m: m.text == "➕ Add Credits" and m.chat.type == 'private' and is_admin(m.from_user.id))
 def btn_add_credits(m):
     msg = bot.reply_to(m, "Send User ID to add credits to:")
     bot.register_next_step_handler(msg, ask_amount_add)
@@ -979,7 +1002,7 @@ def do_add_credits(m, target):
         )
     except: pass
 
-@bot.message_handler(func=lambda m: m.text == "➖ Remove Credits" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
+@bot.message_handler(func=lambda m: m.text == "➖ Remove Credits" and m.chat.type == 'private' and is_admin(m.from_user.id))
 def btn_remove_credits(m):
     msg = bot.reply_to(m, "Send User ID to remove credits from:")
     bot.register_next_step_handler(msg, ask_amount_remove)
@@ -1012,7 +1035,7 @@ def do_remove_credits(m, target):
         parse_mode='HTML', reply_markup=credit_mgr_kb()
     )
 
-@bot.message_handler(func=lambda m: m.text == "💰 Set Credits" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
+@bot.message_handler(func=lambda m: m.text == "💰 Set Credits" and m.chat.type == 'private' and is_admin(m.from_user.id))
 def btn_set_credits(m):
     msg = bot.reply_to(m, "Send User ID to set credits for:")
     bot.register_next_step_handler(msg, ask_amount_set)
@@ -1045,7 +1068,7 @@ def do_set_credits(m, target):
         parse_mode='HTML', reply_markup=credit_mgr_kb()
     )
 
-@bot.message_handler(func=lambda m: m.text == "👤 Check User" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
+@bot.message_handler(func=lambda m: m.text == "👤 Check User" and m.chat.type == 'private' and is_admin(m.from_user.id))
 def btn_check_user(m):
     msg = bot.reply_to(m, "Send User ID to check:")
     bot.register_next_step_handler(msg, do_check_user)
@@ -1077,7 +1100,7 @@ def do_check_user(m):
     )
     bot.reply_to(m, txt_out, parse_mode='HTML', reply_markup=credit_mgr_kb())
 
-@bot.message_handler(func=lambda m: m.text == "🔙 Admin Menu" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
+@bot.message_handler(func=lambda m: m.text == "🔙 Admin Menu" and m.chat.type == 'private' and is_admin(m.from_user.id))
 def btn_admin_menu(m):
     bot.reply_to(m, "👑 <b>Admin Panel</b>", parse_mode='HTML', reply_markup=admin_kb())
 
