@@ -1,17 +1,74 @@
 """
-Username Info Bot — DEEP LOGIC EDITION (v4.2 - URLLIB EDITION)
-+ No external requests module needed (uses built-in urllib)
+Username Info Bot — DEEP LOGIC EDITION (v4.3 - AUTO INSTALL)
++ Auto-installs missing modules at startup
++ No external requests module needed (uses urllib)
 + Group me bilkul chup (koi reply nahi)
-+ Force Join System (Enable/Disable, Channel, Invite Link)
-+ Credit Management (Add/Remove/Set/Check User)
-+ JSON storage (No MongoDB)
++ Force Join System
++ Credit Management
++ JSON storage
 """
 
-import os, sys, re, json, time, threading, html
+import os, sys, subprocess, time
+
+# ============================================================
+# ⭐ AUTO-INSTALLER — runs before any external import
+# ============================================================
+_PACKAGE_MAP = {
+    "telebot": "pyTelegramBotAPI==4.14.0",
+    "dotenv":  "python-dotenv==1.0.0",
+}
+
+def _ensure_modules():
+    missing = []
+    for mod_name, pkg_name in _PACKAGE_MAP.items():
+        try:
+            __import__(mod_name)
+        except ImportError:
+            missing.append((mod_name, pkg_name))
+
+    if not missing:
+        print("✅ All modules present", flush=True)
+        return
+
+    print(f"⚠️ Missing modules: {[m[0] for m in missing]}", flush=True)
+    print("⏳ Auto-installing...", flush=True)
+
+    # Upgrade pip first (silent)
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "pip", "--quiet"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        pass
+
+    for mod_name, pkg_name in missing:
+        print(f"📦 Installing {pkg_name}...", flush=True)
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--no-cache-dir", pkg_name],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            print(f"✅ Installed {pkg_name}", flush=True)
+        except Exception as e:
+            print(f"❌ Failed to install {pkg_name}: {e}", flush=True)
+            sys.exit(1)
+
+    # Verify
+    for mod_name, _ in missing:
+        try:
+            __import__(mod_name)
+        except ImportError:
+            print(f"❌ {mod_name} still missing after install", flush=True)
+            sys.exit(1)
+
+_ensure_modules()
+# ============================================================
+
+import re, json, threading, html
 import logging
 from datetime import datetime, timedelta
 
-# ---------- Safe dotenv import (optional) ----------
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -20,9 +77,7 @@ except ImportError:
 except Exception:
     pass
 
-# ---------- Built-in HTTP (no external module) ----------
 import urllib.request
-import urllib.parse
 import urllib.error
 import ssl
 
@@ -66,13 +121,12 @@ if not BOT_TOKEN:
     logger.critical("❌ BOT_TOKEN missing in environment")
     sys.exit(1)
 
-# ---------- SSL Context (bypass cert issues on some hosts) ----------
+# ---------- SSL ----------
 _SSL_CTX = ssl.create_default_context()
 _SSL_CTX.check_hostname = False
 _SSL_CTX.verify_mode = ssl.CERT_NONE
 
 def http_get_json(url, timeout=15):
-    """Built-in HTTP GET with JSON response. Returns (status_code, data_or_None, error_msg)"""
     try:
         req = urllib.request.Request(
             url,
@@ -96,7 +150,7 @@ def http_get_json(url, timeout=15):
     except Exception as e:
         return 0, None, f"Unexpected: {e}"
 
-# ---------- All Button Texts ----------
+# ---------- All Buttons ----------
 ALL_BUTTONS = [
     "🔒 Username To Info", "🛒 Buy Credits", "👤 My Profile", "ℹ️ About",
     "👑 Admin Panel", "📊 Dashboard", "📢 Broadcast",
@@ -273,7 +327,7 @@ def esc(s):
     if s is None: return ""
     return html.escape(str(s), quote=False)
 
-# ---------- Animation Class ----------
+# ---------- Animation ----------
 class AnimMsg:
     def __init__(self, cid, *frames, interval=0.5, reply_to=None):
         self.cid = cid; self.frames = list(frames); self.interval = interval
@@ -354,7 +408,7 @@ def build_search_frames(prefix="🔒 <b>Username Lookup</b>"):
     frames.append(f"✅ {prefix}\n<code>{progress_bar(100)}</code>")
     return frames
 
-# ================= FORCE JOIN =================
+# ---------- Force Join ----------
 def is_user_joined(uid):
     fj = settings.get("force_join", {})
     if not fj.get("enabled") or not fj.get("channel"):
@@ -460,7 +514,7 @@ def force_join_status_text():
         f"<i>Note: Bot ko channel me admin hona chahiye warna verification fail hoga.</i>"
     )
 
-# ================= CORE: USERNAME & ID LOOKUP (urllib) =================
+# ================= CORE LOOKUP =================
 def process_tg2num(uid, cid, query, reply_to=None):
     query = query.strip()
     if not query:
@@ -508,7 +562,6 @@ def process_tg2num(uid, cid, query, reply_to=None):
             )
             return
 
-    # ⭐ urllib based API call (no external requests)
     api_url = f"{TG2NUM_API_URL}{tg_id}"
     status_code, api_data, err = http_get_json(api_url, timeout=15)
 
@@ -890,7 +943,6 @@ def do_check_user(m):
 def btn_admin_menu(m):
     bot.reply_to(m, "👑 <b>Admin Panel</b>", parse_mode='HTML', reply_markup=admin_kb())
 
-# ================= PRIVATE CHAT HANDLER =================
 @bot.message_handler(func=lambda m: m.chat.type == 'private' and m.content_type == 'text' and not m.text.startswith('/'))
 def private_text_handler(m):
     uid = m.from_user.id
@@ -916,7 +968,7 @@ def private_text_handler(m):
 
 # ================= ENTRY =================
 if __name__ == "__main__":
-    logger.info("🚀 Bot starting (v4.2 URLLIB EDITION)...")
+    logger.info("🚀 Bot starting (v4.3 AUTO INSTALL)...")
     logger.info(f"👑 Admin ID: {ADMIN_ID}")
     logger.info(f"📞 Admin contact: {ADMIN_USERNAME}")
     logger.info(f"🔗 Force Join: {'ON' if settings['force_join'].get('enabled') else 'OFF'}")
