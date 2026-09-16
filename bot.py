@@ -1,9 +1,9 @@
 """
-Username Info Bot — DEEP LOGIC EDITION (v4.3 - AUTO INSTALL)
-+ Auto-installs missing modules at startup
-+ No external requests module needed (uses urllib)
-+ Group me bilkul chup (koi reply nahi)
-+ Force Join System
+Username Info Bot — DEEP LOGIC EDITION (v5 - MULTI FORCE JOIN)
++ Auto-installs missing modules
++ 3 Force Join channels (env configurable)
++ No external requests module (uses urllib)
++ Group me silent
 + Credit Management
 + JSON storage
 """
@@ -11,7 +11,7 @@ Username Info Bot — DEEP LOGIC EDITION (v4.3 - AUTO INSTALL)
 import os, sys, subprocess, time
 
 # ============================================================
-# ⭐ AUTO-INSTALLER — runs before any external import
+# ⭐ AUTO-INSTALLER
 # ============================================================
 _PACKAGE_MAP = {
     "telebot": "pyTelegramBotAPI==4.14.0",
@@ -33,7 +33,6 @@ def _ensure_modules():
     print(f"⚠️ Missing modules: {[m[0] for m in missing]}", flush=True)
     print("⏳ Auto-installing...", flush=True)
 
-    # Upgrade pip first (silent)
     try:
         subprocess.check_call(
             [sys.executable, "-m", "pip", "install", "--upgrade", "pip", "--quiet"],
@@ -54,7 +53,6 @@ def _ensure_modules():
             print(f"❌ Failed to install {pkg_name}: {e}", flush=True)
             sys.exit(1)
 
-    # Verify
     for mod_name, _ in missing:
         try:
             __import__(mod_name)
@@ -121,6 +119,23 @@ if not BOT_TOKEN:
     logger.critical("❌ BOT_TOKEN missing in environment")
     sys.exit(1)
 
+# ---------- Force Join Env Loading ----------
+def _load_force_join_env():
+    """Read 3 force join channels from env"""
+    enabled = os.getenv("FORCE_JOIN_ENABLED", "false").lower() == "true"
+    channels = []
+    for i in (1, 2, 3):
+        cid = os.getenv(f"FORCE_JOIN_CHANNEL_{i}", "").strip()
+        link = os.getenv(f"FORCE_JOIN_LINK_{i}", "").strip()
+        if cid:
+            if not link:
+                link = f"https://t.me/{cid.lstrip('@')}" if cid.startswith("@") else f"https://t.me/c/{cid.lstrip('-100')}"
+            channels.append({"channel": cid, "link": link})
+    return enabled, channels
+
+_FJ_ENV_ENABLED, _FJ_ENV_CHANNELS = _load_force_join_env()
+logger.info(f"🔗 Force Join from env: {'ON' if _FJ_ENV_ENABLED else 'OFF'} ({len(_FJ_ENV_CHANNELS)} channels)")
+
 # ---------- SSL ----------
 _SSL_CTX = ssl.create_default_context()
 _SSL_CTX.check_hostname = False
@@ -150,7 +165,7 @@ def http_get_json(url, timeout=15):
     except Exception as e:
         return 0, None, f"Unexpected: {e}"
 
-# ---------- All Buttons ----------
+# ---------- Buttons ----------
 ALL_BUTTONS = [
     "🔒 Username To Info", "🛒 Buy Credits", "👤 My Profile", "ℹ️ About",
     "👑 Admin Panel", "📊 Dashboard", "📢 Broadcast",
@@ -162,14 +177,19 @@ ALL_BUTTONS = [
 
 # ---------- JSON Storage ----------
 def _default_data():
+    env_channels = []
+    for ch in _FJ_ENV_CHANNELS:
+        env_channels.append({
+            "channel": ch["channel"],
+            "link": ch["link"]
+        })
     return {
         "users": {},
         "stats": {"total_searches": 0, "searches_today": 0, "last_date": ""},
         "settings": {
             "force_join": {
-                "enabled": False,
-                "channel": None,
-                "channel_link": None
+                "enabled": _FJ_ENV_ENABLED,
+                "channels": env_channels
             }
         }
     }
@@ -187,9 +207,25 @@ def load_data():
         d.setdefault("stats", default["stats"])
         d.setdefault("settings", {})
         d["settings"].setdefault("force_join", default["settings"]["force_join"])
-        d["settings"]["force_join"].setdefault("enabled", False)
-        d["settings"]["force_join"].setdefault("channel", None)
-        d["settings"]["force_join"].setdefault("channel_link", None)
+        fj = d["settings"]["force_join"]
+        fj.setdefault("enabled", False)
+        # Migrate old format (single channel) → new format (list)
+        if "channels" not in fj:
+            old_ch = fj.get("channel")
+            old_link = fj.get("channel_link")
+            if old_ch:
+                fj["channels"] = [{"channel": old_ch, "link": old_link or ""}]
+            else:
+                fj["channels"] = []
+            fj.pop("channel", None)
+            fj.pop("channel_link", None)
+        # If env enabled and DB empty, seed from env
+        if _FJ_ENV_ENABLED and not fj["channels"] and _FJ_ENV_CHANNELS:
+            fj["channels"] = [
+                {"channel": ch["channel"], "link": ch["link"]}
+                for ch in _FJ_ENV_CHANNELS
+            ]
+            fj["enabled"] = True
         return d
     except Exception as e:
         logger.error(f"Corrupt data.json, resetting... Error: {e}")
@@ -309,7 +345,7 @@ bot = telebot.TeleBot(BOT_TOKEN)
 try: bot.remove_webhook()
 except: pass
 
-# ---------- Rate Limiting ----------
+# ---------- Rate Limit ----------
 _rate_lock = threading.Lock()
 _last_call = {}
 def rate_ok(uid):
@@ -408,42 +444,62 @@ def build_search_frames(prefix="🔒 <b>Username Lookup</b>"):
     frames.append(f"✅ {prefix}\n<code>{progress_bar(100)}</code>")
     return frames
 
-# ---------- Force Join ----------
+# ================= FORCE JOIN (MULTI) =================
+def get_fj_channels():
+    """Return list of {channel, link}"""
+    fj = settings.get("force_join", {})
+    return fj.get("channels", []) or []
+
 def is_user_joined(uid):
     fj = settings.get("force_join", {})
-    if not fj.get("enabled") or not fj.get("channel"):
+    if not fj.get("enabled"):
+        return True
+    channels = get_fj_channels()
+    if not channels:
         return True
     if uid == ADMIN_ID:
         return True
-    try:
-        member = bot.get_chat_member(fj["channel"], uid)
-        if member.status in ("member", "administrator", "creator"):
-            return True
-        if getattr(member, "status", "") == "restricted" and getattr(member, "is_member", False):
-            return True
-        return False
-    except Exception as e:
-        logger.warning(f"ForceJoin check failed for {uid}: {e} — failing OPEN")
-        return True
+
+    for ch in channels:
+        cid = ch.get("channel")
+        if not cid:
+            continue
+        try:
+            member = bot.get_chat_member(cid, uid)
+            status = getattr(member, "status", "")
+            if status in ("member", "administrator", "creator"):
+                continue
+            if status == "restricted" and getattr(member, "is_member", False):
+                continue
+            return False  # Not joined this channel
+        except Exception as e:
+            logger.warning(f"ForceJoin check failed for {uid} on {cid}: {e} — failing OPEN")
+            # If bot can't check (not admin), fail open to not break user
+            continue
+    return True
 
 def build_join_kb():
-    fj = settings.get("force_join", {})
-    channel = fj.get("channel") or ""
-    link = fj.get("channel_link") or f"https://t.me/{str(channel).lstrip('@')}"
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("📢 Join Channel", url=link))
-    kb.add(InlineKeyboardButton("✅ I've Joined", callback_data="check_join"))
+    channels = get_fj_channels()
+    kb = InlineKeyboardMarkup(row_width=1)
+    for i, ch in enumerate(channels[:10], 1):
+        link = ch.get("link") or ""
+        if link:
+            kb.add(InlineKeyboardButton(f"📢 Join Channel {i}", url=link))
+    kb.add(InlineKeyboardButton("✅ I've Joined All", callback_data="check_join"))
     return kb
 
 def ensure_joined(uid, cid, reply_to=None):
     if is_user_joined(uid):
         return True
+    channels = get_fj_channels()
+    if not channels:
+        return True
     try:
         bot.send_message(
             cid,
-            "⚠️ <b>Force Join Required</b>\n\n"
-            "Bot use karne se pehle channel join karein.\n"
-            "Join karne ke baad <b>✅ I've Joined</b> button dabayein.",
+            f"⚠️ <b>Force Join Required</b>\n\n"
+            f"Bot use karne se pehle <b>{len(channels)}</b> channels join karein:\n\n"
+            f"Join karne ke baad <b>✅ I've Joined All</b> button dabayein.",
             parse_mode="HTML",
             reply_markup=build_join_kb(),
             reply_to_message_id=reply_to
@@ -468,7 +524,7 @@ def cb_check_join(c):
             )
         except: pass
     else:
-        bot.answer_callback_query(c.id, "❌ Aapne abhi channel join nahi kiya!", show_alert=True)
+        bot.answer_callback_query(c.id, "❌ Kuch channels join nahi kiye!", show_alert=True)
 
 # ---------- Keyboards ----------
 def main_kb(uid):
@@ -504,15 +560,24 @@ def credit_mgr_kb():
 def force_join_status_text():
     fj = settings.get("force_join", {})
     status = "🟢 ENABLED" if fj.get("enabled") else "🔴 DISABLED"
-    channel = fj.get("channel") or "— Not set —"
-    link = fj.get("channel_link") or "— Not set —"
-    return (
-        f"🔗 <b>Force Join Settings</b>\n\n"
-        f"Status: <b>{status}</b>\n"
-        f"Channel: <code>{esc(channel)}</code>\n"
-        f"Invite Link: <code>{esc(link)}</code>\n\n"
-        f"<i>Note: Bot ko channel me admin hona chahiye warna verification fail hoga.</i>"
-    )
+    channels = get_fj_channels()
+    lines = [
+        f"🔗 <b>Force Join Settings</b>",
+        f"",
+        f"Status: <b>{status}</b>",
+        f"Channels: <b>{len(channels)}</b>",
+        f"",
+    ]
+    if channels:
+        for i, ch in enumerate(channels, 1):
+            lines.append(f"<b>{i}.</b> <code>{esc(ch.get('channel'))}</code>")
+            if ch.get("link"):
+                lines.append(f"   🔗 {esc(ch.get('link'))}")
+    else:
+        lines.append("<i>No channels set</i>")
+    lines.append("")
+    lines.append("<i>Env se load ho sakte hain ya admin panel se add karein.</i>")
+    return "\n".join(lines)
 
 # ================= CORE LOOKUP =================
 def process_tg2num(uid, cid, query, reply_to=None):
@@ -690,13 +755,15 @@ def btn_admin(m):
 @bot.message_handler(func=lambda m: m.text == "📊 Dashboard" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
 def btn_dashboard(m):
     fj = settings.get("force_join", {})
+    ch_count = len(get_fj_channels())
     txt = (
         f"📊 <b>Dashboard</b>\n\n"
         f"👥 Total Users: <b>{total_users()}</b>\n"
         f"🔥 Active (24h): <b>{active_users_24h()}</b>\n"
         f"🔍 Total Searches: <b>{total_searches()}</b>\n"
         f"📅 Searches Today: <b>{searches_today()}</b>\n\n"
-        f"🔗 Force Join: <b>{'🟢 ON' if fj.get('enabled') else '🔴 OFF'}</b>"
+        f"🔗 Force Join: <b>{'🟢 ON' if fj.get('enabled') else '🔴 OFF'}</b>\n"
+        f"📢 Channels: <b>{ch_count}</b>"
     )
     bot.reply_to(m, txt, parse_mode='HTML')
 
@@ -733,7 +800,8 @@ def btn_set_channel(m):
     msg = bot.reply_to(
         m,
         "Send the channel username (e.g. <code>@mychannel</code>) or channel ID "
-        "(e.g. <code>-1001234567890</code>).",
+        "(e.g. <code>-1001234567890</code>).\n\n"
+        "<i>Note: This will ADD a new channel. To remove, restart with updated env.</i>",
         parse_mode='HTML'
     )
     bot.register_next_step_handler(msg, do_set_channel)
@@ -747,16 +815,20 @@ def do_set_channel(m):
         return
     try:
         chat = bot.get_chat(val)
-        settings["force_join"]["channel"] = val
-        if not settings["force_join"].get("channel_link"):
-            if chat.username:
-                settings["force_join"]["channel_link"] = f"https://t.me/{chat.username}"
+        settings["force_join"].setdefault("channels", [])
+        link = ""
+        if chat.username:
+            link = f"https://t.me/{chat.username}"
+        settings["force_join"]["channels"].append({
+            "channel": val,
+            "link": link
+        })
         save_data(data)
         bot.reply_to(
             m,
-            f"✅ Channel set to <code>{esc(val)}</code>\n"
+            f"✅ Channel added: <code>{esc(val)}</code>\n"
             f"📛 Title: {esc(chat.title or '')}\n"
-            f"🔗 Link: {esc(str(settings['force_join'].get('channel_link') or '—'))}",
+            f"🔗 Link: {esc(link or '—')}",
             parse_mode='HTML', reply_markup=force_join_kb()
         )
     except Exception as e:
@@ -769,7 +841,12 @@ def do_set_channel(m):
 
 @bot.message_handler(func=lambda m: m.text == "🔗 Set Invite Link" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
 def btn_set_link(m):
-    msg = bot.reply_to(m, "Send the invite link (e.g. <code>https://t.me/+AbCdEf123</code>):", parse_mode='HTML')
+    msg = bot.reply_to(
+        m,
+        "Send the invite link for the LAST added channel "
+        "(e.g. <code>https://t.me/+AbCdEf123</code>):",
+        parse_mode='HTML'
+    )
     bot.register_next_step_handler(msg, do_set_link)
 
 def do_set_link(m):
@@ -779,21 +856,27 @@ def do_set_link(m):
     if not val.startswith("http"):
         bot.reply_to(m, "❌ Invalid link. Must start with http/https.")
         return
-    settings["force_join"]["channel_link"] = val
+    chs = settings["force_join"].get("channels", [])
+    if not chs:
+        bot.reply_to(m, "❌ No channel added yet. Use 🔧 Set Channel first.")
+        return
+    chs[-1]["link"] = val
     save_data(data)
     bot.reply_to(m, f"✅ Invite link saved:\n<code>{esc(val)}</code>", parse_mode='HTML', reply_markup=force_join_kb())
 
 @bot.message_handler(func=lambda m: m.text == "⚙️ Toggle Force Join" and m.from_user.id == ADMIN_ID and m.chat.type == 'private')
 def btn_toggle_fj(m):
     fj = settings["force_join"]
-    if not fj.get("channel"):
+    chs = fj.get("channels", [])
+    if not chs:
         bot.reply_to(m, "⚠️ Pehle channel set karein (🔧 Set Channel).", reply_markup=force_join_kb())
         return
     fj["enabled"] = not fj.get("enabled", False)
     save_data(data)
     bot.reply_to(
         m,
-        f"{'🟢 Force Join ENABLED' if fj['enabled'] else '🔴 Force Join DISABLED'}",
+        f"{'🟢 Force Join ENABLED' if fj['enabled'] else '🔴 Force Join DISABLED'}\n"
+        f"📢 Channels: {len(chs)}",
         reply_markup=force_join_kb()
     )
 
@@ -968,10 +1051,11 @@ def private_text_handler(m):
 
 # ================= ENTRY =================
 if __name__ == "__main__":
-    logger.info("🚀 Bot starting (v4.3 AUTO INSTALL)...")
+    logger.info("🚀 Bot starting (v5 MULTI FORCE JOIN)...")
     logger.info(f"👑 Admin ID: {ADMIN_ID}")
     logger.info(f"📞 Admin contact: {ADMIN_USERNAME}")
-    logger.info(f"🔗 Force Join: {'ON' if settings['force_join'].get('enabled') else 'OFF'}")
+    fj = settings.get("force_join", {})
+    logger.info(f"🔗 Force Join: {'ON' if fj.get('enabled') else 'OFF'} ({len(get_fj_channels())} channels)")
     try:
         bot.infinity_polling(timeout=60, long_polling_timeout=30)
     except KeyboardInterrupt:
