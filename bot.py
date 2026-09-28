@@ -308,7 +308,7 @@ async def aadhar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query_val = context.args[0]
     await context.bot.send_message(chat_id=chat_id, text=f"🔍 Searching Aadhar Database...\n\n🆔 Query: {query_val}{COPYRIGHT}")
 
-    url = f"{NUM_API_URL}?number={query_val}&key={NUM_API_KEY}"
+    url = f"{https://reuters-memorabilia-insulin-disclose.trycloudflare.com/aadhaar}?number={query_val}&key={DADDY}"
 
     try:
         response = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
